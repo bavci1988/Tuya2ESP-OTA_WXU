@@ -1,0 +1,159 @@
+#include "ccs811.h"
+#include "esphome/core/hal.h"
+#include "esphome/core/helpers.h"
+#include "esphome/core/log.h"
+
+namespace esphome::ccs811 {
+
+ESPHOME_LOG_TAG(TAG, "ccs811");
+
+// based on
+//  - https://cdn.sparkfun.com/datasheets/BreakoutBoards/CCS811_Programming_Guide.pdf
+
+#define CHECK_TRUE(f, message) \
+  if (!(f)) { \
+    this->mark_failed(LOG_STR(message)); \
+    return; \
+  }
+
+#define CHECKED_IO(f) CHECK_TRUE(f, ESP_LOG_MSG_COMM_FAIL)
+
+void CCS811Component::setup() {
+  // page 9 programming guide - hwid is always 0x81
+  uint8_t hw_id;
+  CHECKED_IO(this->read_byte(0x20, &hw_id))
+  CHECK_TRUE(hw_id == 0x81, "Sensor reported an invalid ID. Is this a CCS811?")
+
+  // software reset, page 3 - allowed to fail
+  this->write_bytes(0xFF, {0x11, 0xE5, 0x72, 0x8A});
+  delay(5);
+
+  // page 10, APP_START
+  CHECK_TRUE(!this->status_has_error_(), "Sensor reported internal error")
+  CHECK_TRUE(this->status_app_is_valid_(), "Sensor reported invalid APP installed")
+  CHECK_TRUE(this->write_bytes(0xF4, {}), "Sensor reported APP start failed")
+  // App setup, wait for it to load
+  delay(1);
+
+  // set MEAS_MODE (page 5)
+  uint8_t meas_mode = 0;
+  uint32_t interval = this->get_update_interval();
+  if (interval >= 60 * 1000) {
+    meas_mode = 3 << 4;  // sensor takes a reading every 60 seconds
+  } else if (interval >= 10 * 1000) {
+    meas_mode = 2 << 4;  // sensor takes a reading every 10 seconds
+  } else if (interval >= 1 * 1000) {
+    meas_mode = 1 << 4;  // sensor takes a reading every second
+  } else {
+    meas_mode = 4 << 4;  // sensor takes a reading every 250ms
+  }
+
+  CHECKED_IO(this->write_byte(0x01, meas_mode))
+
+  if (this->baseline_.has_value()) {
+    // baseline available, write to sensor
+    this->write_bytes(0x11, decode_value(*this->baseline_));
+  }
+
+  auto hardware_version_data = this->read_bytes<1>(0x21);
+  auto bootloader_version_data = this->read_bytes<2>(0x23);
+  auto application_version_data = this->read_bytes<2>(0x24);
+
+  uint8_t hardware_version = 0;
+  uint16_t bootloader_version = 0;
+  uint16_t application_version = 0;
+
+  if (hardware_version_data.has_value()) {
+    hardware_version = (*hardware_version_data)[0];
+  }
+
+  if (bootloader_version_data.has_value()) {
+    bootloader_version = encode_uint16((*bootloader_version_data)[0], (*bootloader_version_data)[1]);
+  }
+
+  if (application_version_data.has_value()) {
+    application_version = encode_uint16((*application_version_data)[0], (*application_version_data)[1]);
+  }
+
+  ESP_LOGD(TAG, "hardware_version=0x%x bootloader_version=0x%x application_version=0x%x\n", hardware_version,
+           bootloader_version, application_version);
+  if (this->version_text_sensor_ != nullptr) {
+    char version[20];  // "15.15.15 (0xffff)" is 17 chars, plus NUL, plus wiggle room
+    buf_append_printf(version, sizeof(version), 0, "%d.%d.%d (0x%02x)", (application_version >> 12 & 15),
+                      (application_version >> 8 & 15), (application_version >> 4 & 15), application_version);
+    ESP_LOGD(TAG, "publishing version state: %s", version);
+    this->version_text_sensor_->publish_state(version);
+  }
+}
+void CCS811Component::update() {
+  if (!this->status_has_data_()) {
+    ESP_LOGD(TAG, "Status indicates no data ready!");
+    this->status_set_warning();
+    return;
+  }
+
+  // page 12 - alg result data
+  auto alg_data = this->read_bytes<4>(0x02);
+  if (!alg_data.has_value()) {
+    ESP_LOGW(TAG, "Reading CCS811 data failed!");
+    this->status_set_warning();
+    return;
+  }
+  auto res = *alg_data;
+  uint16_t co2 = encode_uint16(res[0], res[1]);
+  uint16_t tvoc = encode_uint16(res[2], res[3]);
+
+  // also print baseline
+  auto baseline_data = this->read_bytes<2>(0x11);
+  uint16_t baseline = 0;
+  if (baseline_data.has_value()) {
+    baseline = encode_uint16((*baseline_data)[0], (*baseline_data)[1]);
+  }
+
+  ESP_LOGD(TAG, "Got co2=%u ppm, tvoc=%u ppb, baseline=0x%04X", co2, tvoc, baseline);
+
+  PUBLISH_STATE(this->co2_sensor_, co2);
+  PUBLISH_STATE(this->tvoc_sensor_, tvoc);
+
+  this->status_clear_warning();
+
+  this->send_env_data_();
+}
+void CCS811Component::send_env_data_() {
+  if (this->humidity_sensor_ == nullptr && this->temperature_sensor_ == nullptr)
+    return;
+
+  float humidity = sensor::source_value(this->humidity_sensor_, 0.0f, 100.0f);
+  if (std::isnan(humidity))
+    humidity = 50;
+  float temperature = sensor::source_value(this->temperature_sensor_, -25.0f, 50.0f);
+  if (std::isnan(temperature))
+    temperature = 25;
+  // temperature has a 25° offset to allow negative temperatures
+  temperature += 25;
+
+  // At page 18 of:
+  // https://cdn.sparkfun.com/datasheets/BreakoutBoards/CCS811_Programming_Guide.pdf
+  // Reference code:
+  // https://github.com/adafruit/Adafruit_CCS811/blob/0990f5c620354d8bc087c4706bec091d8e6e5dfd/Adafruit_CCS811.cpp#L135-L142
+  // lroundf already rounds to nearest; the reference adds 0.5 only because it truncates.
+  uint16_t hum_conv = static_cast<uint16_t>(lroundf(humidity * 512.0f));
+  uint16_t temp_conv = static_cast<uint16_t>(lroundf(temperature * 512.0f));
+  this->write_bytes(0x05, {(uint8_t) ((hum_conv >> 8) & 0xff), (uint8_t) ((hum_conv & 0xff)),
+                           (uint8_t) ((temp_conv >> 8) & 0xff), (uint8_t) ((temp_conv & 0xff))});
+}
+void CCS811Component::dump_config() {
+  ESP_LOGCONFIG(TAG, "CCS811");
+  LOG_I2C_DEVICE(this)
+  LOG_UPDATE_INTERVAL(this);
+  LOG_SENSOR("  ", "CO2 Sensor", this->co2_sensor_);
+  LOG_SENSOR("  ", "TVOC Sensor", this->tvoc_sensor_);
+  LOG_TEXT_SENSOR("  ", "Firmware Version Sensor", this->version_text_sensor_);
+  if (this->baseline_) {
+    ESP_LOGCONFIG(TAG, "  Baseline: %04X", *this->baseline_);
+  } else {
+    ESP_LOGCONFIG(TAG, "  Baseline: NOT SET");
+  }
+}
+
+}  // namespace esphome::ccs811

@@ -1,0 +1,61 @@
+// Implementation based on:
+//  - ESPEasy: https://github.com/letscontrolit/ESPEasy/blob/mega/src/_P034_DHT12.ino
+//  - DHT12_sensor_library: https://github.com/xreef/DHT12_sensor_library/blob/master/DHT12.cpp
+
+#include "dht12.h"
+#include "esphome/core/helpers.h"
+#include "esphome/core/log.h"
+
+namespace esphome::dht12 {
+
+ESPHOME_LOG_TAG(TAG, "dht12");
+
+void DHT12Component::update() {
+  uint8_t data[5];
+  if (!this->read_data_(data)) {
+    this->status_set_warning();
+    return;
+  }
+  const uint16_t raw_temperature = uint16_t(data[2]) * 10 + (data[3] & 0x7F);
+  float temperature = raw_temperature / 10.0f;
+  if ((data[3] & 0x80) != 0) {
+    // negative
+    temperature *= -1;
+  }
+
+  const uint16_t raw_humidity = uint16_t(data[0]) * 10 + data[1];
+  float humidity = raw_humidity / 10.0f;
+
+  ESP_LOGD(TAG, "Got temperature=%.2f°C humidity=%.2f%%", temperature, humidity);
+  PUBLISH_STATE(this->temperature_sensor_, temperature);
+  PUBLISH_STATE(this->humidity_sensor_, humidity);
+  this->status_clear_warning();
+}
+void DHT12Component::setup() {
+  uint8_t data[5];
+  if (!this->setup_check(this->read_data_(data)))
+    return;
+}
+void DHT12Component::dump_config() {
+  ESP_LOGD(TAG, "DHT12:");
+  LOG_I2C_DEVICE(this);
+  LOG_SENSOR("  ", "Temperature", this->temperature_sensor_);
+  LOG_SENSOR("  ", "Humidity", this->humidity_sensor_);
+}
+
+bool DHT12Component::read_data_(uint8_t *data) {
+  if (!this->read_bytes(0, data, 5)) {
+    ESP_LOGW(TAG, "Updating DHT12 failed!");
+    return false;
+  }
+
+  uint8_t checksum = sum_bytes(data, 4);
+  if (data[4] != checksum) {
+    ESP_LOGW(TAG, "DHT12 Checksum invalid!");
+    return false;
+  }
+
+  return true;
+}
+
+}  // namespace esphome::dht12

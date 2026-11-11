@@ -1,0 +1,61 @@
+#pragma once
+
+#include "esphome/core/component.h"
+#include "esphome/core/automation.h"
+#include "esphome/components/sensor/sensor.h"
+
+namespace esphome::sensor {
+
+class ValueRangeTrigger final : public Trigger<float>, public Component {
+ public:
+  explicit ValueRangeTrigger(Sensor *parent) : parent_(parent) {}
+
+  template<typename V> void set_min(V min) { this->min_ = min; }
+  template<typename V> void set_max(V max) { this->max_ = max; }
+
+  void setup() override {
+    this->rtc_ = this->parent_->make_entity_preference<bool>();
+    bool initial_state;
+    if (this->rtc_.load(&initial_state)) {
+      this->previous_in_range_ = initial_state;
+    }
+
+    this->parent_->add_on_state_callback([this](float state) { this->on_state_(state); });
+  }
+  float get_setup_priority() const override { return setup_priority::HARDWARE; }
+
+ protected:
+  void on_state_(float state) {
+    if (std::isnan(state))
+      return;
+
+    float local_min = this->min_.value(state);
+    float local_max = this->max_.value(state);
+
+    bool in_range;
+    if (std::isnan(local_min) && std::isnan(local_max)) {
+      in_range = this->previous_in_range_;
+    } else if (std::isnan(local_min)) {
+      in_range = state <= local_max;
+    } else if (std::isnan(local_max)) {
+      in_range = state >= local_min;
+    } else {
+      in_range = local_min <= state && state <= local_max;
+    }
+
+    if (in_range != this->previous_in_range_ && in_range) {
+      this->trigger(state);
+    }
+
+    this->previous_in_range_ = in_range;
+    this->rtc_.save(&in_range);
+  }
+
+  Sensor *parent_;
+  ESPPreferenceObject rtc_;
+  bool previous_in_range_{false};
+  TemplatableFn<float, float> min_{[](float) -> float { return NAN; }};
+  TemplatableFn<float, float> max_{[](float) -> float { return NAN; }};
+};
+
+}  // namespace esphome::sensor

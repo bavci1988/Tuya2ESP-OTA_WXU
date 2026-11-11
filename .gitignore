@@ -1,0 +1,22 @@
+# Build artifacts
+build/
+out/
+.pioenvs/
+.piolibdeps/
+*.gch
+*.o
+*.obj
+*.elf
+*.bin.tmp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ruff_cache/
+.pytest_cache/
+
+# Editor / OS
+.DS_Store
+*.swp

@@ -1,0 +1,76 @@
+#pragma once
+#include "esphome/core/color.h"
+#include "esphome/components/display/display.h"
+
+#ifdef USE_LVGL
+#include "esphome/components/lvgl/lvgl_proxy.h"
+#endif  // USE_LVGL
+
+namespace esphome::image {
+
+enum ImageType {
+  IMAGE_TYPE_BINARY = 0,
+  IMAGE_TYPE_GRAYSCALE = 1,
+  IMAGE_TYPE_RGB = 2,
+  IMAGE_TYPE_RGB565 = 3,
+  IMAGE_TYPE_RGB111 = 4,  // one bit per channel plus an optional alpha bit, for colour e-paper
+};
+
+enum Transparency {
+  TRANSPARENCY_OPAQUE = 0,
+  TRANSPARENCY_CHROMA_KEY = 1,
+  TRANSPARENCY_ALPHA_CHANNEL = 2,
+};
+
+class Image : public display::BaseImage {
+ public:
+  /// big_endian is the RGB565 byte order; codegen writes little endian unless configured otherwise.
+  Image(const uint8_t *data_start, int width, int height, ImageType type, Transparency transparency,
+        bool big_endian = false);
+  Color get_pixel(int x, int y, Color color_on = display::COLOR_ON, Color color_off = display::COLOR_OFF) const;
+  int get_width() const override;
+  int get_height() const override;
+  const uint8_t *get_data_start() const { return this->data_start_; }
+  ImageType get_type() const;
+
+  int get_bpp() const { return this->bpp_; }
+
+  /// Return the stride of the image in bytes, that is, the distance in bytes
+  /// between two consecutive rows of pixels.
+  size_t get_width_stride() const { return (this->width_ * this->get_bpp() + 7u) / 8u; }
+  void draw(int x, int y, display::Display *display, Color color_on, Color color_off) override;
+
+  bool has_transparency() const { return this->transparency_ != TRANSPARENCY_OPAQUE; }
+
+#ifdef USE_LVGL
+  virtual lv_image_dsc_t *get_lv_image_dsc();
+#endif
+#ifdef USE_LVGL_IMAGE
+  /// Called when an LVGL image widget is given this image. An image whose size can change keeps the widget, so it can
+  /// give the widget its source again when the size changes: the widget keeps the size it read from the descriptor.
+  virtual void add_lvgl_widget(lv_obj_t *obj) {}
+#endif
+ protected:
+  /// Per-pixel draw of the clipped range, rows (true) or columns (false) outer.
+  template<bool ROWS_OUTER>
+  void draw_(int x, int y, display::Display *display, Color color_on, Color color_off, int x_start, int x_end,
+             int y_start, int y_end);
+  bool get_binary_pixel_(int x, int y) const;
+  Color get_rgb111_pixel_(int x, int y) const;
+  Color get_rgb_pixel_(int x, int y) const;
+  Color get_rgb565_pixel_(int x, int y) const;
+  Color get_grayscale_pixel_(int x, int y) const;
+
+  int width_;
+  int height_;
+  ImageType type_;
+  const uint8_t *data_start_;
+  Transparency transparency_;
+  bool big_endian_;
+  uint8_t bpp_{};
+#ifdef USE_LVGL
+  lv_img_dsc_t dsc_{};
+#endif
+};
+
+}  // namespace esphome::image

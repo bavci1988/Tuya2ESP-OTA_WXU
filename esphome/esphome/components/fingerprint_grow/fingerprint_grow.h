@@ -1,0 +1,191 @@
+#pragma once
+
+#include "esphome/core/component.h"
+#include "esphome/core/helpers.h"
+#include "esphome/components/sensor/sensor.h"
+#include "esphome/components/binary_sensor/binary_sensor.h"
+#include "esphome/components/uart/uart.h"
+
+#include <limits>
+#include <vector>
+
+namespace esphome::fingerprint_grow {
+
+static const uint16_t START_CODE = 0xEF01;
+
+static const uint16_t ENROLLMENT_SLOT_UNUSED = 0xFFFF;
+
+// The datasheet says a max wake up time of of 200ms.
+static const uint8_t WAIT_FOR_WAKE_UP_MS = 200;
+
+static const uint32_t DEFAULT_IDLE_PERIOD_TO_SLEEP_MS = 5000;
+
+enum GrowPacketType {
+  COMMAND = 0x01,
+  DATA = 0x02,
+  ACK = 0x07,
+  END_DATA = 0x08,
+};
+
+enum GrowCommand {
+  GET_IMAGE = 0x01,
+  IMAGE_2_TZ = 0x02,
+  SEARCH = 0x04,
+  REG_MODEL = 0x05,
+  STORE = 0x06,
+  LOAD = 0x07,
+  UPLOAD = 0x08,
+  DELETE = 0x0C,
+  DELETE_ALL = 0x0D,  // aka EMPTY
+  READ_SYS_PARAM = 0x0F,
+  SET_PASSWORD = 0x12,
+  VERIFY_PASSWORD = 0x13,
+  HI_SPEED_SEARCH = 0x1B,
+  TEMPLATE_COUNT = 0x1D,
+  AURA_CONFIG = 0x35,
+  LED_ON = 0x50,
+  LED_OFF = 0x51,
+};
+
+enum GrowResponse {
+  OK = 0x00,
+  PACKET_RCV_ERR = 0x01,
+  NO_FINGER = 0x02,
+  IMAGE_FAIL = 0x03,
+  IMAGE_MESS = 0x06,
+  FEATURE_FAIL = 0x07,
+  NO_MATCH = 0x08,
+  NOT_FOUND = 0x09,
+  ENROLL_MISMATCH = 0x0A,
+  BAD_LOCATION = 0x0B,
+  DB_RANGE_FAIL = 0x0C,
+  UPLOAD_FEATURE_FAIL = 0x0D,
+  PACKET_RESPONSE_FAIL = 0x0E,
+  UPLOAD_FAIL = 0x0F,
+  DELETE_FAIL = 0x10,
+  DB_CLEAR_FAIL = 0x11,
+  PASSWORD_FAIL = 0x13,
+  INVALID_IMAGE = 0x15,
+  FLASH_ERR = 0x18,
+  INVALID_REG = 0x1A,
+  HANDSHAKE_SIGN = 0x55,
+  BAD_PACKET = 0xFE,
+  TIMEOUT = 0xFF,
+};
+
+enum GrowAuraLEDState {
+  BREATHING = 0x01,
+  FLASHING = 0x02,
+  ALWAYS_ON = 0x03,
+  ALWAYS_OFF = 0x04,
+  GRADUAL_ON = 0x05,
+  GRADUAL_OFF = 0x06,
+};
+
+enum GrowAuraLEDColor {
+  RED = 0x01,
+  BLUE = 0x02,
+  PURPLE = 0x03,
+  GREEN = 0x04,
+  YELLOW = 0x05,
+  CYAN = 0x06,
+  WHITE = 0x07,
+};
+
+class FingerprintGrowComponent final : public PollingComponent, public uart::UARTDevice {
+  SUB_SENSOR(fingerprint_count)
+  SUB_SENSOR(status)
+  SUB_SENSOR(capacity)
+  SUB_SENSOR(security_level)
+  SUB_SENSOR(last_finger_id)
+  SUB_SENSOR(last_confidence)
+  SUB_BINARY_SENSOR(enrolling)
+
+ public:
+  void update() override;
+  void setup() override;
+  void dump_config() override;
+
+  void set_address(uint32_t address) { put_be32(this->address_, address); }
+  void set_sensing_pin(GPIOPin *sensing_pin) { this->sensing_pin_ = sensing_pin; }
+  void set_sensor_power_pin(GPIOPin *sensor_power_pin) { this->sensor_power_pin_ = sensor_power_pin; }
+  void set_password(uint32_t password) { this->password_ = password; }
+  void set_new_password(uint32_t new_password) { this->new_password_ = new_password; }
+  void set_idle_period_to_sleep_ms(uint32_t period_ms) { this->idle_period_to_sleep_ms_ = period_ms; }
+  template<typename F> void add_on_finger_scan_start_callback(F &&callback) {
+    this->finger_scan_start_callback_.add(std::forward<F>(callback));
+  }
+  template<typename F> void add_on_finger_scan_matched_callback(F &&callback) {
+    this->finger_scan_matched_callback_.add(std::forward<F>(callback));
+  }
+  template<typename F> void add_on_finger_scan_unmatched_callback(F &&callback) {
+    this->finger_scan_unmatched_callback_.add(std::forward<F>(callback));
+  }
+  template<typename F> void add_on_finger_scan_misplaced_callback(F &&callback) {
+    this->finger_scan_misplaced_callback_.add(std::forward<F>(callback));
+  }
+  template<typename F> void add_on_finger_scan_invalid_callback(F &&callback) {
+    this->finger_scan_invalid_callback_.add(std::forward<F>(callback));
+  }
+  template<typename F> void add_on_enrollment_scan_callback(F &&callback) {
+    this->enrollment_scan_callback_.add(std::forward<F>(callback));
+  }
+  template<typename F> void add_on_enrollment_done_callback(F &&callback) {
+    this->enrollment_done_callback_.add(std::forward<F>(callback));
+  }
+
+  template<typename F> void add_on_enrollment_failed_callback(F &&callback) {
+    this->enrollment_failed_callback_.add(std::forward<F>(callback));
+  }
+
+  void enroll_fingerprint(uint16_t finger_id, uint8_t num_buffers);
+  void finish_enrollment(uint8_t result);
+  void delete_fingerprint(uint16_t finger_id);
+  void delete_all_fingerprints();
+
+  void led_control(bool state);
+  void aura_led_control(uint8_t state, uint8_t speed, uint8_t color, uint8_t count);
+
+ protected:
+  void scan_and_match_();
+  uint8_t scan_image_(uint8_t buffer);
+  uint8_t save_fingerprint_();
+  bool check_password_();
+  bool set_password_();
+  bool get_parameters_();
+  void get_fingerprint_count_();
+  uint8_t transfer_(std::vector<uint8_t> &data_buffer);
+  uint8_t send_command_();
+  void sensor_wakeup_();
+  void sensor_sleep_();
+
+  std::vector<uint8_t> data_ = {};
+  uint8_t address_[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+  uint16_t capacity_ = 64;
+  uint32_t password_ = 0x0;
+  uint32_t new_password_ = std::numeric_limits<uint32_t>::max();
+  GPIOPin *sensing_pin_{nullptr};
+  GPIOPin *sensor_power_pin_{nullptr};
+  uint8_t enrollment_image_ = 0;
+  uint16_t enrollment_slot_ = ENROLLMENT_SLOT_UNUSED;
+  uint8_t enrollment_buffers_ = 5;
+  bool waiting_removal_ = false;
+  bool has_sensing_pin_ = false;
+  bool has_power_pin_ = false;
+  bool is_sensor_awake_ = false;
+  uint32_t last_transfer_ms_ = 0;
+  uint32_t last_aura_led_control_ = 0;
+  uint32_t last_aura_led_duration_ = 0;
+  uint16_t system_identifier_code_ = 0;
+  uint32_t idle_period_to_sleep_ms_ = UINT32_MAX;
+  CallbackManager<void()> finger_scan_invalid_callback_;
+  CallbackManager<void()> finger_scan_start_callback_;
+  CallbackManager<void(uint16_t, uint16_t)> finger_scan_matched_callback_;
+  CallbackManager<void()> finger_scan_unmatched_callback_;
+  CallbackManager<void()> finger_scan_misplaced_callback_;
+  CallbackManager<void(uint8_t, uint16_t)> enrollment_scan_callback_;
+  CallbackManager<void(uint16_t)> enrollment_done_callback_;
+  CallbackManager<void(uint16_t)> enrollment_failed_callback_;
+};
+
+}  // namespace esphome::fingerprint_grow

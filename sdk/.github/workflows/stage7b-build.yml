@@ -1,0 +1,209 @@
+name: XR806 integrated standby + Tuya MCU AWIH cross-build
+on:
+  push:
+    branches: [ci/stage7b-standby-compile]
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  stage7b-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout pinned XR806 SDK (private; isolated)
+        uses: actions/checkout@v4
+        with:
+          ref: 963f6f74030bc2fdbf430e66092ca96f6a0c7a6c
+          path: vendor-sdk
+          persist-credentials: false
+      - name: Checkout integrated XR806/Tuya standby branch
+        uses: actions/checkout@v4
+        with:
+          repository: bavci1988/esphome-xr806
+          ref: 1f7898c86c3f8b297577760dc73e9f8ccdfb3c70
+          path: esphome-src
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Record integrated source revision
+        run: |
+          git -C esphome-src log -1 --format='XR806/TUYA BRIDGE SOURCE %H %s'
+          git -C vendor-sdk rev-parse HEAD
+      - name: Install ARM toolchain and Python build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-dev libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
+          python -m pip install -e ./esphome-src
+      - name: Build OFFLINE WXU PA20/timer standby AWIH (no logger backend)
+        env:
+          CC_DIR: /usr/bin
+          XR806_SDK_SOURCE_DIR: ${{ github.workspace }}/vendor-sdk
+          XR806_SDK_EXPECTED_COMMIT: 963f6f74030bc2fdbf430e66092ca96f6a0c7a6c
+        run: |
+          cat > /tmp/stage7b-ci.yaml <<'YAML'
+          esphome:
+            name: xr806-stage7b-ci
+          xr806:
+            board: wxu
+            lowpower: true
+            standby_trial:
+              confirm_offline: true
+              entry_after_ms: 10000
+              wake_after_ms: 3000
+              wake_pin: PA20
+              wake_edge: falling
+              resume_marker_pb05: false
+          YAML
+          cd esphome-src
+          python -m esphome config /tmp/stage7b-ci.yaml
+          python -m esphome -v compile /tmp/stage7b-ci.yaml
+          python - <<'PY'
+          from pathlib import Path
+          base = Path("/tmp/.esphome/build/xr806-stage7b-ci")
+          image = base / "xr806/firmware/firmware.img"
+          output = base / ".pioenvs/xr806-stage7b-ci/firmware.bin"
+          for path in (image, output):
+              assert path.is_file() and path.stat().st_size > 0, path
+              assert path.read_bytes()[:4] == b"AWIH", path
+              print(f"PASS XR806 AWIH: {path} ({path.stat().st_size} bytes)")
+          PY
+      - name: Save bench-only AWIH image
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xr806-stage7b-bench-awih
+          path: /tmp/.esphome/build/xr806-stage7b-ci/.pioenvs/xr806-stage7b-ci/firmware.bin
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Cross-compile guarded production standby core (no transports)
+        env:
+          CC_DIR: /usr/bin
+          XR806_SDK_SOURCE_DIR: ${{ github.workspace }}/vendor-sdk
+          XR806_SDK_EXPECTED_COMMIT: 963f6f74030bc2fdbf430e66092ca96f6a0c7a6c
+        run: |
+          cat > /tmp/stage7b-production-ci.yaml <<'YAML'
+          esphome:
+            name: xr806-production-ci
+          xr806:
+            board: wxu
+            lowpower: true
+            standby:
+              enabled: true
+              wake_after_ms: 3000
+              quiet_ms: 250
+              min_awake_ms: 5000
+              wake_pin: PA20
+              wake_edge: falling
+              require_external_sync: false
+          YAML
+          cd esphome-src
+          python -m esphome config /tmp/stage7b-production-ci.yaml
+          python -m esphome -v compile /tmp/stage7b-production-ci.yaml
+          python - <<'PY'
+          from pathlib import Path
+          base = Path("/tmp/.esphome/build/xr806-production-ci")
+          for path in (base/"xr806/firmware/firmware.img", base/".pioenvs/xr806-production-ci/firmware.bin"):
+              assert path.is_file() and path.stat().st_size > 0, path
+              assert path.read_bytes()[:4] == b"AWIH", path
+              print("PASS opt-in XR806 production coordinator AWIH:", path)
+          PY
+
+      - name: Build integrated Tuya autobaud and guarded standby contract
+        env:
+          CC_DIR: /usr/bin
+          XR806_SDK_SOURCE_DIR: ${{ github.workspace }}/vendor-sdk
+          XR806_SDK_EXPECTED_COMMIT: 963f6f74030bc2fdbf430e66092ca96f6a0c7a6c
+        run: |
+          # Tuya protocol and XR806 platform now share the same tested branch.
+          git -C esphome-src log -1 --format='INTEGRATED COMMIT %H %s'
+          cat > /tmp/stage7b-mcu-integration.yaml <<'YAML'
+          esphome:
+            name: xr806-mcu-integration
+          xr806:
+            board: wxu
+            lowpower: true
+            standby:
+              enabled: true
+              wake_after_ms: 3000
+              quiet_ms: 250
+              min_awake_ms: 5000
+              wake_pin: PA20
+              wake_edge: falling
+              require_external_sync: true
+          uart:
+            id: uart_bus
+            tx_pin: PB0
+            rx_pin: PB1
+            baud_rate: 115200
+          tuya:
+            id: tuya_mcu
+            uart_id: uart_bus
+            protocol: low_power_v0
+            auto_baud: true
+          YAML
+          cd esphome-src
+          python -m esphome config /tmp/stage7b-mcu-integration.yaml
+          python -m esphome -v compile /tmp/stage7b-mcu-integration.yaml
+          python - <<'PY'
+          from pathlib import Path
+          image=Path("/tmp/.esphome/build/xr806-mcu-integration/xr806/firmware/firmware.img")
+          assert image.is_file() and image.read_bytes()[:4] == b"AWIH"
+          print("PASS combined XR806 PM + Tuya CMD01 autobaud AWIH build:",image.stat().st_size)
+          PY
+
+      - name: Validate mixed MCU, WLAN bridge and Native API profile
+        env:
+          CC_DIR: /usr/bin
+          XR806_SDK_SOURCE_DIR: ${{ github.workspace }}/vendor-sdk
+          XR806_SDK_EXPECTED_COMMIT: 963f6f74030bc2fdbf430e66092ca96f6a0c7a6c
+        run: |
+          cat > /tmp/stage7b-connected-integration.yaml <<'YAML'
+          esphome:
+            name: xr806-connected-integration
+          xr806:
+            board: wxu
+            lowpower: true
+            wifi:
+              ssid: Stage7b-CI-Only
+              password: Stage7bNotRealPassword
+              network_bridge: true
+              network_suspend: true
+              power_save: true
+              dtim: 1
+            standby:
+              enabled: true
+              wake_after_ms: 3000
+              quiet_ms: 250
+              min_awake_ms: 5000
+              wake_pin: PA20
+              wake_edge: falling
+              require_external_sync: true
+          network:
+          api:
+          mdns:
+          uart:
+            id: uart_bus
+            tx_pin: PB0
+            rx_pin: PB1
+            baud_rate: 115200
+          tuya:
+            id: tuya_mcu
+            uart_id: uart_bus
+            protocol: low_power_v0
+            auto_baud: true
+          YAML
+          cd esphome-src
+          python -m esphome config /tmp/stage7b-connected-integration.yaml
+          python -m esphome -v compile /tmp/stage7b-connected-integration.yaml
+          python - <<'PY'
+          from pathlib import Path
+          image=Path("/tmp/.esphome/build/xr806-connected-integration/xr806/firmware/firmware.img")
+          assert image.is_file() and image.read_bytes()[:4] == b"AWIH"
+          print("PASS combined WLAN/API + MCU/autobaud + guarded standby build:", image.stat().st_size)
+          PY

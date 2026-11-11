@@ -1,0 +1,38 @@
+import esphome.codegen as cg
+from esphome.components import text_sensor
+import esphome.config_validation as cv
+from esphome.const import (
+    CONF_DEVICE,
+    ENTITY_CATEGORY_DIAGNOSTIC,
+    ICON_CHIP,
+    ICON_RESTART,
+)
+from esphome.types import ConfigType
+
+from . import CONF_DEBUG_ID, DebugComponent
+
+DEPENDENCIES = ["debug"]
+
+
+CONF_RESET_REASON = "reset_reason"
+CONFIG_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(CONF_DEBUG_ID): cv.use_id(DebugComponent),
+        cv.Optional(CONF_DEVICE): text_sensor.text_sensor_schema(
+            icon=ICON_CHIP,
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+        ),
+        cv.Optional(CONF_RESET_REASON): text_sensor.text_sensor_schema(
+            icon=ICON_RESTART,
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+        ),
+    }
+)
+
+
+async def to_code(config: ConfigType) -> None:
+    hub = await cg.get_variable(config[CONF_DEBUG_ID])
+
+    text_sensors = text_sensor.sub_text_sensors(config)
+    await text_sensors(CONF_DEVICE, hub.set_device_info_text_sensor)
+    await text_sensors(CONF_RESET_REASON, hub.set_reset_reason_text_sensor)

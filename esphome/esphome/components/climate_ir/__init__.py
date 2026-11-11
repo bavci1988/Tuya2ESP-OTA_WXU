@@ -1,0 +1,90 @@
+import logging
+
+import esphome.codegen as cg
+from esphome.components import climate, remote_base, sensor
+import esphome.config_validation as cv
+from esphome.const import (
+    CONF_HUMIDITY_SENSOR,
+    CONF_SENSOR,
+    CONF_SUPPORTS_COOL,
+    CONF_SUPPORTS_HEAT,
+)
+from esphome.cpp_generator import MockObj, MockObjClass
+from esphome.types import ConfigType, SafeExpType
+
+_LOGGER = logging.getLogger(__name__)
+
+CONF_SUPPORTS_HEAT_COOL = "supports_heat_cool"
+
+DEPENDENCIES = ["remote_transmitter"]
+AUTO_LOAD = ["sensor", "remote_base"]
+CODEOWNERS = ["@glmnet"]
+DOMAIN = "climate_ir"
+
+climate_ir_ns = cg.esphome_ns.namespace("climate_ir")
+ClimateIR = climate_ir_ns.class_(
+    "ClimateIR",
+    climate.Climate,
+    cg.Component,
+    remote_base.RemoteReceiverListener,
+    remote_base.RemoteTransmittable,
+)
+
+
+def climate_ir_schema(
+    class_: MockObjClass,
+    *,
+    fixed_temperature_unit: str | None = None,
+) -> cv.Schema:
+    return (
+        climate.climate_schema(class_, fixed_temperature_unit=fixed_temperature_unit)
+        .extend(
+            {
+                cv.Optional(CONF_SUPPORTS_COOL, default=True): cv.boolean,
+                cv.Optional(CONF_SUPPORTS_HEAT, default=True): cv.boolean,
+                cv.Optional(CONF_SUPPORTS_HEAT_COOL): cv.boolean,
+                cv.Optional(CONF_SENSOR): cv.use_id(sensor.Sensor),
+                cv.Optional(CONF_HUMIDITY_SENSOR): cv.use_id(sensor.Sensor),
+            }
+        )
+        .extend(cv.COMPONENT_SCHEMA)
+        .extend(remote_base.REMOTE_TRANSMITTABLE_SCHEMA)
+    )
+
+
+def climate_ir_with_receiver_schema(
+    class_: MockObjClass,
+    *,
+    fixed_temperature_unit: str | None = None,
+) -> cv.Schema:
+    return climate_ir_schema(
+        class_, fixed_temperature_unit=fixed_temperature_unit
+    ).extend(
+        {
+            cv.Optional(remote_base.CONF_RECEIVER_ID): cv.use_id(
+                remote_base.RemoteReceiverBase
+            ),
+        }
+    )
+
+
+async def register_climate_ir(var: MockObj, config: ConfigType) -> None:
+    await cg.register_component(var, config)
+    await remote_base.register_transmittable(var, config)
+    supports_cool = config[CONF_SUPPORTS_COOL]
+    supports_heat = config[CONF_SUPPORTS_HEAT]
+    cg.add(var.set_supports_cool(supports_cool))
+    cg.add(var.set_supports_heat(supports_heat))
+    # The header default is true, so only the false case needs a call.
+    if not config.get(CONF_SUPPORTS_HEAT_COOL, supports_cool and supports_heat):
+        cg.add(var.set_supports_heat_cool(False))
+    if remote_base.CONF_RECEIVER_ID in config:
+        await remote_base.register_listener(var, config)
+    await cg.add_variable(var.set_sensor, config.get(CONF_SENSOR))
+    await cg.add_variable(var.set_humidity_sensor, config.get(CONF_HUMIDITY_SENSOR))
+
+
+async def new_climate_ir(config: ConfigType, *args: SafeExpType) -> MockObj:
+    var = await climate.new_climate(config, *args)
+    await register_climate_ir(var, config)
+    return var

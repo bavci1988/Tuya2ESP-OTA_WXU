@@ -1,0 +1,300 @@
+import re
+
+from esphome import automation, core
+from esphome.automation import maybe_simple_id
+import esphome.codegen as cg
+from esphome.components.const import CONF_LABEL
+from esphome.components.number import Number
+from esphome.components.select import Select
+from esphome.components.switch import Switch
+import esphome.config_validation as cv
+from esphome.const import (
+    CONF_ACTIVE,
+    CONF_COMMAND,
+    CONF_CUSTOM,
+    CONF_FORMAT,
+    CONF_ID,
+    CONF_ITEMS,
+    CONF_MODE,
+    CONF_NUMBER,
+    CONF_ON_VALUE,
+    CONF_SWITCH,
+    CONF_TEXT,
+    CONF_TYPE,
+)
+from esphome.cpp_generator import MockObj
+from esphome.types import ConfigType
+
+CODEOWNERS = ["@numo68"]
+DOMAIN = "display_menu_base"
+
+display_menu_base_ns = cg.esphome_ns.namespace("display_menu_base")
+
+
+CONF_ROTARY = "rotary"
+CONF_JOYSTICK = "joystick"
+CONF_MENU = "menu"
+CONF_BACK = "back"
+CONF_SELECT = "select"
+CONF_ON_TEXT = "on_text"
+CONF_OFF_TEXT = "off_text"
+CONF_VALUE_LAMBDA = "value_lambda"
+CONF_IMMEDIATE_EDIT = "immediate_edit"
+CONF_ROOT_ITEM_ID = "root_item_id"
+CONF_ON_ENTER = "on_enter"
+CONF_ON_LEAVE = "on_leave"
+CONF_ON_NEXT = "on_next"
+CONF_ON_PREV = "on_prev"
+
+DisplayMenuComponent = display_menu_base_ns.class_("DisplayMenuComponent", cg.Component)
+
+MenuItem = display_menu_base_ns.class_("MenuItem")
+MenuItemConstPtr = MenuItem.operator("ptr").operator("const")
+MenuItemMenu = display_menu_base_ns.class_("MenuItemMenu")
+MenuItemSelect = display_menu_base_ns.class_("MenuItemSelect")
+MenuItemNumber = display_menu_base_ns.class_("MenuItemNumber")
+MenuItemSwitch = display_menu_base_ns.class_("MenuItemSwitch")
+MenuItemCommand = display_menu_base_ns.class_("MenuItemCommand")
+MenuItemCustom = display_menu_base_ns.class_("MenuItemCustom")
+
+
+MenuItemType = display_menu_base_ns.enum("MenuItemType")
+
+MENU_ITEM_TYPES = {
+    CONF_LABEL: MenuItemType.MENU_ITEM_LABEL,
+    CONF_MENU: MenuItemType.MENU_ITEM_MENU,
+    CONF_BACK: MenuItemType.MENU_ITEM_BACK,
+    CONF_SELECT: MenuItemType.MENU_ITEM_SELECT,
+    CONF_NUMBER: MenuItemType.MENU_ITEM_NUMBER,
+    CONF_SWITCH: MenuItemType.MENU_ITEM_SWITCH,
+    CONF_COMMAND: MenuItemType.MENU_ITEM_COMMAND,
+    CONF_CUSTOM: MenuItemType.MENU_ITEM_CUSTOM,
+}
+
+MENU_ITEMS_WITH_SPECIALIZED_CLASSES = (
+    CONF_MENU,
+    CONF_SELECT,
+    CONF_NUMBER,
+    CONF_SWITCH,
+    CONF_COMMAND,
+    CONF_CUSTOM,
+)
+
+MenuMode = display_menu_base_ns.enum("MenuMode")
+
+MENU_MODES = {
+    CONF_ROTARY: MenuMode.MENU_MODE_ROTARY,
+    CONF_JOYSTICK: MenuMode.MENU_MODE_JOYSTICK,
+}
+
+
+def validate_format(format):
+    if re.search(r"^%[+-]*(\d+)?(\.\d+)?[fg]$", format) is None:
+        raise cv.Invalid(
+            f"{CONF_FORMAT}: has to specify a printf-like format string specifying exactly one f or g type conversion, '{format}' provided"
+        )
+
+    return format
+
+
+# Use a simple indirection to circumvent the recursion limitation
+def menu_item_schema(value):
+    return MENU_ITEM_SCHEMA(value)
+
+
+MENU_ITEM_COMMON_SCHEMA = cv.Schema(
+    {
+        cv.Optional(CONF_TEXT): cv.templatable(cv.string),
+    }
+)
+
+MENU_ITEM_ENTER_LEAVE_SCHEMA = MENU_ITEM_COMMON_SCHEMA.extend(
+    {
+        cv.Optional(CONF_ON_ENTER): automation.validate_automation({}),
+        cv.Optional(CONF_ON_LEAVE): automation.validate_automation({}),
+    }
+)
+
+MENU_ITEM_VALUE_SCHEMA = MENU_ITEM_COMMON_SCHEMA.extend(
+    {
+        cv.Optional(CONF_ON_VALUE): automation.validate_automation({}),
+    }
+)
+
+MENU_ITEM_ENTER_LEAVE_VALUE_SCHEMA = MENU_ITEM_ENTER_LEAVE_SCHEMA.extend(
+    {
+        cv.Optional(CONF_ON_VALUE): automation.validate_automation({}),
+    }
+)
+
+MENU_ITEM_SCHEMA = cv.typed_schema(
+    {
+        CONF_LABEL: MENU_ITEM_COMMON_SCHEMA.extend(
+            {
+                cv.GenerateID(CONF_ID): cv.declare_id(MenuItem),
+            }
+        ),
+        CONF_BACK: MENU_ITEM_COMMON_SCHEMA.extend(
+            {
+                cv.GenerateID(CONF_ID): cv.declare_id(MenuItem),
+            }
+        ),
+        CONF_MENU: MENU_ITEM_ENTER_LEAVE_SCHEMA.extend(
+            {
+                cv.GenerateID(CONF_ID): cv.declare_id(MenuItemMenu),
+                cv.Required(CONF_ITEMS): cv.All(
+                    cv.ensure_list(menu_item_schema), cv.Length(min=1)
+                ),
+            }
+        ),
+        CONF_SELECT: MENU_ITEM_ENTER_LEAVE_VALUE_SCHEMA.extend(
+            {
+                cv.GenerateID(CONF_ID): cv.declare_id(MenuItemSelect),
+                cv.Required(CONF_SELECT): cv.use_id(Select),
+                cv.Optional(CONF_IMMEDIATE_EDIT, default=False): cv.boolean,
+                cv.Optional(CONF_VALUE_LAMBDA): cv.returning_lambda,
+            }
+        ),
+        CONF_NUMBER: MENU_ITEM_ENTER_LEAVE_VALUE_SCHEMA.extend(
+            {
+                cv.GenerateID(CONF_ID): cv.declare_id(MenuItemNumber),
+                cv.Required(CONF_NUMBER): cv.use_id(Number),
+                cv.Optional(CONF_IMMEDIATE_EDIT, default=False): cv.boolean,
+                cv.Optional(CONF_FORMAT, default="%.1f"): cv.All(
+                    cv.string_strict,
+                    validate_format,
+                ),
+                cv.Optional(CONF_VALUE_LAMBDA): cv.returning_lambda,
+            }
+        ),
+        CONF_SWITCH: MENU_ITEM_ENTER_LEAVE_VALUE_SCHEMA.extend(
+            {
+                cv.GenerateID(CONF_ID): cv.declare_id(MenuItemSwitch),
+                cv.Required(CONF_SWITCH): cv.use_id(Switch),
+                cv.Optional(CONF_IMMEDIATE_EDIT, default=False): cv.boolean,
+                cv.Optional(CONF_ON_TEXT, default="On"): cv.string_strict,
+                cv.Optional(CONF_OFF_TEXT, default="Off"): cv.string_strict,
+                cv.Optional(CONF_VALUE_LAMBDA): cv.returning_lambda,
+            }
+        ),
+        CONF_COMMAND: MENU_ITEM_VALUE_SCHEMA.extend(
+            {
+                cv.GenerateID(CONF_ID): cv.declare_id(MenuItemCommand),
+            }
+        ),
+        CONF_CUSTOM: MENU_ITEM_ENTER_LEAVE_VALUE_SCHEMA.extend(
+            {
+                cv.GenerateID(CONF_ID): cv.declare_id(MenuItemCustom),
+                cv.Optional(CONF_IMMEDIATE_EDIT, default=False): cv.boolean,
+                cv.Optional(CONF_VALUE_LAMBDA): cv.returning_lambda,
+                cv.Optional(CONF_ON_NEXT): automation.validate_automation({}),
+                cv.Optional(CONF_ON_PREV): automation.validate_automation({}),
+            }
+        ),
+    },
+    default_type="label",
+    lower=True,
+)
+
+DISPLAY_MENU_BASE_SCHEMA = cv.Schema(
+    {
+        cv.Optional(CONF_ACTIVE, default=True): cv.boolean,
+        cv.GenerateID(CONF_ROOT_ITEM_ID): cv.declare_id(MenuItemMenu),
+        cv.Optional(CONF_MODE, default=CONF_ROTARY): cv.enum(MENU_MODES),
+        cv.Optional(CONF_ON_ENTER): automation.validate_automation({}),
+        cv.Optional(CONF_ON_LEAVE): automation.validate_automation({}),
+        cv.Required(CONF_ITEMS): cv.All(
+            cv.ensure_list(MENU_ITEM_SCHEMA), cv.Length(min=1)
+        ),
+    }
+).extend(cv.COMPONENT_SCHEMA)
+
+MENU_ACTION_SCHEMA = maybe_simple_id(
+    {
+        cv.GenerateID(CONF_ID): cv.use_id(DisplayMenuComponent),
+    }
+)
+
+
+for _name, _call in (
+    ("display_menu.up", "up()"),
+    ("display_menu.down", "down()"),
+    ("display_menu.left", "left()"),
+    ("display_menu.right", "right()"),
+    ("display_menu.enter", "enter()"),
+    ("display_menu.show", "show()"),
+    ("display_menu.hide", "hide()"),
+    ("display_menu.show_main", "show_main()"),
+):
+    automation.register_apply_action(
+        _name, MENU_ACTION_SCHEMA, automation.ApplyCall(_call)
+    )
+
+automation.register_apply_condition(
+    "display_menu.is_active", MENU_ACTION_SCHEMA, "is_active()"
+)
+
+
+# Each item callback carries nothing; the automation receives the item itself.
+_ITEM_CALLBACKS = (
+    (CONF_ON_ENTER, "add_on_enter_callback"),
+    (CONF_ON_LEAVE, "add_on_leave_callback"),
+    (CONF_ON_VALUE, "add_on_value_callback"),
+    (CONF_ON_NEXT, "add_on_next_callback"),
+    (CONF_ON_PREV, "add_on_prev_callback"),
+)
+
+
+async def _build_item_automations(item: MockObj, config: ConfigType) -> None:
+    for conf_key, callback_method in _ITEM_CALLBACKS:
+        for conf in config.get(conf_key, []):
+            await automation.build_parent_callback_automation(
+                item, callback_method, (MenuItemConstPtr, "it"), conf
+            )
+
+
+async def menu_item_to_code(menu, config, parent):
+    if config[CONF_TYPE] in MENU_ITEMS_WITH_SPECIALIZED_CLASSES:
+        item = cg.new_Pvariable(config[CONF_ID])
+    else:
+        item = cg.new_Pvariable(config[CONF_ID], MENU_ITEM_TYPES[config[CONF_TYPE]])
+    cg.add(parent.add_item(item))
+    if CONF_TEXT in config:
+        if isinstance(config[CONF_TEXT], core.Lambda):
+            template_ = await cg.templatable(
+                config[CONF_TEXT], [(MenuItemConstPtr, "it")], cg.std_string
+            )
+            cg.add(item.set_text(template_))
+        else:
+            cg.add(item.set_text(config[CONF_TEXT]))
+    if CONF_VALUE_LAMBDA in config:
+        template_ = await cg.process_lambda(
+            config[CONF_VALUE_LAMBDA],
+            [(MenuItemConstPtr, "it")],
+            return_type=cg.std_string,
+        )
+        cg.add(item.set_value_lambda(template_))
+    if CONF_ITEMS in config:
+        for c in config[CONF_ITEMS]:
+            await menu_item_to_code(menu, c, item)
+    cg.add_optional(item.set_immediate_edit, config.get(CONF_IMMEDIATE_EDIT))
+    if config[CONF_TYPE] == CONF_SELECT:
+        await cg.add_variable(item.set_variable_select, config[CONF_SELECT])
+    if config[CONF_TYPE] == CONF_NUMBER:
+        await cg.add_variable(item.set_variable_number, config[CONF_NUMBER])
+        cg.add(item.set_format(config[CONF_FORMAT]))
+    if config[CONF_TYPE] == CONF_SWITCH:
+        await cg.add_variable(item.set_variable_switch, config[CONF_SWITCH])
+        cg.add(item.set_on_text(config[CONF_ON_TEXT]))
+        cg.add(item.set_off_text(config[CONF_OFF_TEXT]))
+    await _build_item_automations(item, config)
+
+
+async def display_menu_to_code(menu, config):
+    cg.add(menu.set_active(config[CONF_ACTIVE]))
+    root_item = cg.new_Pvariable(config[CONF_ROOT_ITEM_ID])
+    cg.add(menu.set_root_item(root_item))
+    cg.add(menu.set_mode(config[CONF_MODE]))
+    for c in config[CONF_ITEMS]:
+        await menu_item_to_code(menu, c, root_item)
+    await _build_item_automations(root_item, config)

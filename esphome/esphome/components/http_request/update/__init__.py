@@ -1,0 +1,42 @@
+import esphome.codegen as cg
+from esphome.components import ota, update
+import esphome.config_validation as cv
+from esphome.const import CONF_SOURCE
+from esphome.types import ConfigType
+
+from .. import CONF_HTTP_REQUEST_ID, HttpRequestComponent, http_request_ns
+from ..ota import OtaHttpRequestComponent
+
+AUTO_LOAD = ["json"]
+CODEOWNERS = ["@jesserockz"]
+DEPENDENCIES = ["ota.http_request"]
+
+HttpRequestUpdate = http_request_ns.class_(
+    "HttpRequestUpdate", update.UpdateEntity, cg.PollingComponent
+)
+
+CONF_OTA_ID = "ota_id"
+
+CONFIG_SCHEMA = (
+    update.update_schema(HttpRequestUpdate)
+    .extend(
+        {
+            cv.GenerateID(CONF_OTA_ID): cv.use_id(OtaHttpRequestComponent),
+            cv.GenerateID(CONF_HTTP_REQUEST_ID): cv.use_id(HttpRequestComponent),
+            cv.Required(CONF_SOURCE): cv.url,
+        }
+    )
+    .extend(cv.polling_component_schema("6h"))
+)
+
+
+async def to_code(config: ConfigType) -> None:
+    var = await update.new_update(config)
+    await cg.add_variable(var.set_ota_parent, config[CONF_OTA_ID])
+    await cg.add_variable(var.set_request_parent, config[CONF_HTTP_REQUEST_ID])
+
+    cg.add(var.set_source_url_static(config[CONF_SOURCE]))
+
+    ota.request_ota_state_listeners()
+
+    await cg.register_component(var, config)

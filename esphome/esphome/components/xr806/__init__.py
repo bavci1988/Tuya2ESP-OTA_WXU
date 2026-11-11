@@ -1,0 +1,482 @@
+"""Native ESPHome platform for the Allwinner/XRadio XR806 SoC."""
+
+from pathlib import Path
+
+from esphome import final_validate as fv
+import esphome.codegen as cg
+from esphome.components.const import CONF_ENABLED
+import esphome.config_validation as cv
+from esphome.const import (
+    CONF_BOARD,
+    CONF_ID,
+    KEY_CORE,
+    KEY_TARGET_FRAMEWORK,
+    KEY_TARGET_PLATFORM,
+    Framework,
+    ThreadModel,
+)
+from esphome.core import CORE, EsphomeError
+from esphome.types import ConfigType
+
+CODEOWNERS = ["@bavci1988"]
+DOMAIN = "xr806"
+IS_TARGET_PLATFORM = True
+
+OTA_IMAGE_NAME = "firmware.ota.bin"
+
+CONF_WLAN = "wlan"
+CONF_NETWORK_SUSPEND = "network_suspend"
+CONF_DTIM = "dtim"
+CONF_LISTEN_INTERVAL = "listen_interval"
+CONF_STANDBY_TRIAL = "standby_trial"
+CONF_STANDBY = "standby"
+CONF_OTA_GUARD_ID = "ota_guard_id"
+CONF_OTA_DIAGNOSTIC_READONLY = "ota_diagnostic_readonly"
+CONF_API_STANDBY_ID = "api_standby_id"
+CONF_QUIET_MS = "quiet_ms"
+CONF_MIN_AWAKE_MS = "min_awake_ms"
+CONF_REQUIRE_EXTERNAL_SYNC = "require_external_sync"
+CONF_ENTRY_AFTER_MS = "entry_after_ms"
+CONF_WAKE_AFTER_MS = "wake_after_ms"
+CONF_WAKE_PIN = "wake_pin"
+CONF_WAKE_EDGE = "wake_edge"
+CONF_RESUME_MARKER_PB05 = "resume_marker_pb05"
+
+xr806_ns = cg.esphome_ns.namespace("xr806")
+XR806WiFiStandby = xr806_ns.class_("XR806WiFiStandby", cg.Component)
+XR806APIStandby = xr806_ns.class_("XR806APIStandby", cg.Component)
+XR806StandbyTrial = xr806_ns.class_("XR806StandbyTrial", cg.Component)
+XR806StandbyController = xr806_ns.class_("XR806StandbyController", cg.Component)
+XR806OTAStandbyGuard = xr806_ns.class_("XR806OTAStandbyGuard", cg.Component)
+
+
+# Radio settings for the standard wifi: component. DTIM and the listen interval
+# apply when wifi: power_save_mode is LIGHT or HIGH.
+XR806_WLAN_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(): cv.declare_id(XR806WiFiStandby),
+        cv.Optional(CONF_DTIM, default=1): cv.int_range(min=1, max=30),
+        cv.Optional(CONF_LISTEN_INTERVAL, default=0): cv.int_range(min=0, max=30),
+        cv.Optional(CONF_NETWORK_SUSPEND, default=False): cv.boolean,
+    }
+)
+
+
+# Stage 7b is an OFFLINE, bounded one-shot for an isolated WXU test board.
+# Exposed PA wake pins only; PA21..23 are reserved for UART2/boot.
+STANDBY_TRIAL_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(): cv.declare_id(XR806StandbyTrial),
+        cv.Required("confirm_offline"): cv.boolean,
+        cv.Optional(CONF_ENTRY_AFTER_MS, default=10000): cv.int_range(
+            min=1000, max=60000
+        ),
+        cv.Required(CONF_WAKE_AFTER_MS): cv.int_range(min=100, max=5000),
+        cv.Optional(CONF_WAKE_PIN): cv.one_of(
+            "PA11", "PA12", "PA13", "PA19", "PA20", upper=True
+        ),
+        cv.Optional(CONF_WAKE_EDGE, default="falling"): cv.one_of(
+            "falling", "rising", lower=True
+        ),
+        cv.Optional(CONF_RESUME_MARKER_PB05, default=False): cv.boolean,
+    }
+).extend(cv.COMPONENT_SCHEMA)
+
+
+# Stage 7b production-side coordinator: deliberately does NOT implement any
+# Tuya/HC32 commands, UART autobaud, or transport-specific idle voting.
+# A firmware with active transports must register lifecycle participants
+# and its owners must actually clear their fail-closed PM blockers.
+STANDBY_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(): cv.declare_id(XR806StandbyController),
+        cv.GenerateID(CONF_OTA_GUARD_ID): cv.declare_id(XR806OTAStandbyGuard),
+        cv.GenerateID(CONF_API_STANDBY_ID): cv.declare_id(XR806APIStandby),
+        cv.Required(CONF_ENABLED): cv.boolean,
+        cv.Optional(CONF_WAKE_AFTER_MS, default=3000): cv.int_range(min=500, max=60000),
+        cv.Optional(CONF_QUIET_MS, default=250): cv.int_range(min=200, max=30000),
+        cv.Optional(CONF_MIN_AWAKE_MS, default=5000): cv.int_range(min=1000, max=60000),
+        cv.Optional(CONF_WAKE_PIN): cv.one_of(
+            "PA11", "PA12", "PA13", "PA19", "PA20", upper=True
+        ),
+        cv.Optional(CONF_WAKE_EDGE): cv.one_of("falling", "rising", lower=True),
+        cv.Optional(CONF_REQUIRE_EXTERNAL_SYNC, default=False): cv.boolean,
+    }
+).extend(cv.COMPONENT_SCHEMA)
+
+
+def _update_core_data(config: ConfigType) -> None:
+    if config[CONF_WLAN][CONF_NETWORK_SUSPEND] and CONF_STANDBY not in config:
+        raise cv.Invalid(
+            "xr806.wlan.network_suspend requires xr806.standby and full PM gating"
+        )
+    if CONF_STANDBY in config:
+        standby_cfg = config[CONF_STANDBY]
+        if (CONF_WAKE_PIN in standby_cfg) != (CONF_WAKE_EDGE in standby_cfg):
+            raise cv.Invalid(
+                "xr806.standby requires explicit wake_pin and wake_edge together"
+            )
+        if not config["lowpower"]:
+            raise cv.Invalid("xr806.standby requires xr806.lowpower: true")
+        if not config[CONF_STANDBY][CONF_ENABLED]:
+            raise cv.Invalid("Remove xr806.standby when disabled")
+        if CONF_STANDBY_TRIAL in config:
+            raise cv.Invalid("Choose standby or standby_trial, not both")
+    if CONF_STANDBY_TRIAL in config:
+        trial = config[CONF_STANDBY_TRIAL]
+        if not config["lowpower"]:
+            raise cv.Invalid("xr806.standby_trial requires xr806.lowpower: true")
+        if not trial["confirm_offline"]:
+            raise cv.Invalid("xr806.standby_trial requires confirm_offline: true")
+        # PB05 is in the WXU board's conservative Flash/XIP reservation.
+        # No electrical pin-ownership proof exists for the live TRV16.
+        if trial[CONF_RESUME_MARKER_PB05]:
+            raise cv.Invalid(
+                "resume_marker_pb05 is unsafe on the current WXU pin map; "
+                "use timer/current measurements instead"
+            )
+    CORE.data[KEY_CORE][KEY_TARGET_PLATFORM] = DOMAIN
+    CORE.data[KEY_CORE][KEY_TARGET_FRAMEWORK] = Framework.XRADIO
+    return config
+
+
+CONFIG_SCHEMA = cv.All(
+    cv.Schema(
+        {
+            cv.Optional("lowpower", default=False): cv.boolean,
+            cv.Required(CONF_BOARD): cv.one_of("wxu", lower=True),
+            cv.Optional(CONF_WLAN, default={}): XR806_WLAN_SCHEMA,
+            cv.Optional(CONF_STANDBY_TRIAL): STANDBY_TRIAL_SCHEMA,
+            cv.Optional(CONF_STANDBY): STANDBY_SCHEMA,
+            cv.Optional(CONF_OTA_DIAGNOSTIC_READONLY, default=False): cv.boolean,
+        }
+    ),
+    _update_core_data,
+)
+
+
+# The UART backend drives UART0 only, with 8 data bits, no parity and 1 stop bit.
+XR806_UART0_TX = 32  # PB0, WXU pad 15
+XR806_UART0_RX = 33  # PB1, WXU pad 16
+
+
+def _final_validate_uart(config: ConfigType) -> ConfigType:
+    full_config = fv.full_config.get()
+    for index, uart in enumerate(full_config.get("uart", [])):
+        path = ["uart", index]
+        for key, expected, name in (
+            ("tx_pin", XR806_UART0_TX, "PB0"),
+            ("rx_pin", XR806_UART0_RX, "PB1"),
+        ):
+            pin = uart.get(key)
+            if pin is not None and pin["number"] != expected:
+                raise cv.Invalid(f"XR806 UART0 {key} must be {name}", path=[*path, key])
+        if (uart["data_bits"], uart["stop_bits"], str(uart["parity"])) != (
+            8,
+            1,
+            "NONE",
+        ):
+            raise cv.Invalid("XR806 UART supports only 8N1", path=path)
+    return config
+
+
+FINAL_VALIDATE_SCHEMA = _final_validate_uart
+
+
+async def to_code(config: ConfigType) -> None:
+    if config[CONF_OTA_DIAGNOSTIC_READONLY]:
+        # ROM/FDCM read-only snapshot: does not enable ESPHome OTA.
+        cg.add_define("USE_XR806_OTA_RUNTIME_PROBE")
+    # Activate future XR806 PM policy
+    if config["lowpower"]:
+        cg.add_define("USE_XR806_LOWPOWER")
+    if CONF_STANDBY in config:
+        cfg = config[CONF_STANDBY]
+        cg.add_define("USE_XR806_STANDBY_CONTROLLER")
+        cg.add_global(
+            cg.RawStatement('#include "esphome/components/xr806/standby_controller.h"')
+        )
+        controller = cg.new_Pvariable(cfg["id"])
+        cg.add(controller.set_wake_after_ms(cfg[CONF_WAKE_AFTER_MS]))
+        cg.add(controller.set_quiet_ms(cfg[CONF_QUIET_MS]))
+        cg.add(controller.set_min_awake_ms(cfg[CONF_MIN_AWAKE_MS]))
+        if CONF_WAKE_PIN in cfg:
+            cg.add(controller.set_wake_pin(int(cfg[CONF_WAKE_PIN][2:])))
+        cg.add(
+            controller.set_wake_falling(cfg.get(CONF_WAKE_EDGE, "falling") == "falling")
+        )
+        # Transports which are absent can never have work in flight. Present
+        # transports retain their initial busy vote until their own driver
+        # explicitly votes idle; no hardcoded MCU or Tuya protocol assumption.
+        cg.add(controller.set_no_uart("uart" not in CORE.config))
+        cg.add(controller.set_no_network("wifi" not in CORE.config))
+        cg.add(controller.set_no_api("api" not in CORE.config))
+        cg.add(controller.set_no_ota("ota" not in CORE.config))
+        cg.add(controller.set_no_mdns("mdns" not in CORE.config))
+        cg.add(controller.set_external_sync_required(cfg[CONF_REQUIRE_EXTERNAL_SYNC]))
+        cg.add(controller.set_require_uart_participant("uart" in CORE.config))
+        await cg.register_component(controller, cfg)
+        if "api" in CORE.config:
+            # Votes API_BUSY from the public APIServer state.
+            cg.add_global(
+                cg.RawStatement('#include "esphome/components/xr806/api_standby.h"')
+            )
+            api_standby = cg.new_Pvariable(cfg[CONF_API_STANDBY_ID])
+            await cg.register_component(api_standby, {})
+        if "ota" in CORE.config:
+            # OTA state updates are informative, NOT evidence that the
+            # OTA listener and flash writer are already disarmed.
+            cg.add_define("USE_OTA_STATE_LISTENER")
+            cg.add_global(
+                cg.RawStatement(
+                    '#include "esphome/components/xr806/standby_ota_guard.h"'
+                )
+            )
+            ota_guard = cg.new_Pvariable(cfg[CONF_OTA_GUARD_ID])
+            await cg.register_component(ota_guard, cfg)
+
+    if CONF_STANDBY_TRIAL in config:
+        forbidden = (
+            "wifi",
+            "api",
+            "ota",
+            "mqtt",
+            "mdns",
+            "network",
+            "web_server",
+            "uart",
+            "logger",
+            "captive_portal",
+            "improv_serial",
+        )
+        present = [domain for domain in forbidden if domain in CORE.config]
+        if present:
+            raise cv.Invalid(
+                "Stage 7b offline standby_trial forbids active transports: "
+                + ", ".join(present)
+            )
+        trial = config[CONF_STANDBY_TRIAL]
+        cg.add_define("USE_XR806_STANDBY_TRIAL")
+        cg.add_global(
+            cg.RawStatement('#include "esphome/components/xr806/standby_trial.h"')
+        )
+        standby = cg.new_Pvariable(trial["id"])
+        cg.add(standby.set_entry_delay_ms(trial[CONF_ENTRY_AFTER_MS]))
+        cg.add(standby.set_wake_after_ms(trial[CONF_WAKE_AFTER_MS]))
+        if CONF_WAKE_PIN in trial:
+            cg.add(standby.set_wake_pin(int(trial[CONF_WAKE_PIN][2:])))
+        cg.add(standby.set_wake_falling(trial[CONF_WAKE_EDGE] == "falling"))
+        cg.add(standby.set_resume_marker_pb05(trial[CONF_RESUME_MARKER_PB05]))
+        await cg.register_component(standby, trial)
+    cg.add_define("USE_XR806")
+    if "ota" in CORE.config:
+        # A WXU converted from Tuya keeps the Tuya bootloader and its 400 KiB XZ slot;
+        # move its OTA layout once to the one of firmware.bin (ota_boot_layout.h).
+        cg.add_define("USE_XR806_OTA_LAYOUT_MIGRATION")
+    # XR806 uses ordinary addressable memory, not Arduino PROGMEM.
+    cg.add_define("PROGMEM")
+    cg.add_define(ThreadModel.MULTI_ATOMICS)
+    cg.add_define("ESPHOME_BOARD", config[CONF_BOARD])
+
+    if "wifi" in CORE.config:
+        wlan = config[CONF_WLAN]
+        cg.add_define("XR806_WLAN_DTIM", wlan[CONF_DTIM])
+        cg.add_define("XR806_WLAN_LISTEN_INTERVAL", wlan[CONF_LISTEN_INTERVAL])
+        if CONF_STANDBY in config:
+            # Owns NETWORK_BUSY and the native WLAN wakelock; parks the link only
+            # with network_suspend.
+            cg.add_global(
+                cg.RawStatement('#include "esphome/components/xr806/wifi_standby.h"')
+            )
+            standby_wlan = cg.new_Pvariable(wlan[CONF_ID], wlan[CONF_NETWORK_SUSPEND])
+            await cg.register_component(standby_wlan, {})
+
+
+def run_compile(args: object, config: ConfigType) -> bool:
+    """Build an XR806 AWIH image using the XRadio vendor SDK."""
+    import shutil
+    import subprocess
+
+    from .build_support.dependencies import DEPENDENCIES, resolve_dependencies
+    from .build_support.noise_build import prepare_noise_build
+
+    # Locate the ESPHome checkout from this platform module.
+    repo_root = Path(__file__).resolve().parents[3]
+    build = Path(CORE.build_path)
+    source = build / "src"
+    xr_build = build / "xr806"
+    obj = xr_build / "obj"
+    fw_dir = xr_build / "firmware"
+
+    # Resolve pinned Git dependencies from the local cache.
+    try:
+        sdk_cache, arduinojson_src = resolve_dependencies()
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as err:
+        raise EsphomeError(f"XR806 dependency resolution failed: {err}") from err
+
+    adapter = repo_root / "esphome/components/xr806/build_support/xr806_esphome.mk"
+
+    if not adapter.is_file():
+        raise EsphomeError(f"XR806 Make adapter not found: {adapter}")
+
+    # The vendor Makefiles generate files inside their SDK tree.
+    # Never compile directly inside the shared dependency cache.
+    sdk_root = xr_build / "sdk-work"
+    sdk_revision = DEPENDENCIES["xr806_sdk"]["commit"]
+    revision_file = sdk_root / ".esphome-xr806-sdk-revision"
+
+    if sdk_root.exists():
+        if (
+            not sdk_root.is_dir()
+            or not revision_file.is_file()
+            or revision_file.read_text().strip() != sdk_revision
+        ):
+            raise EsphomeError(
+                f"XR806 SDK work directory has an unexpected revision: "
+                f"{sdk_root}. Inspect it before removing or rebuilding it."
+            )
+        print("[XR806] Reusing SDK build workspace", flush=True)
+    else:
+        import tempfile
+
+        xr_build.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=".sdk-stage-", dir=xr_build))
+
+        try:
+            print("[XR806] Creating isolated SDK workspace", flush=True)
+            shutil.copytree(
+                sdk_cache,
+                staging,
+                dirs_exist_ok=True,
+                symlinks=True,
+                ignore=shutil.ignore_patterns(".git"),
+            )
+            (staging / revision_file.name).write_text(sdk_revision + "\n")
+            staging.rename(sdk_root)
+        except (OSError, shutil.Error) as err:
+            raise EsphomeError(f"Could not prepare XR806 SDK workspace: {err}") from err
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
+
+    sdk = sdk_root / "project/demo/trv16_port/gcc"
+
+    if not sdk.is_dir():
+        raise EsphomeError(f"XR806 vendor Makefile directory missing: {sdk}")
+
+    elf = xr_build / "app.elf"
+    image = fw_dir / "firmware.img"
+
+    if not sdk.is_dir() or not adapter.is_file():
+        raise EsphomeError("XR806 SDK or Make adapter not found")
+
+    if not (source / "main.cpp").is_file():
+        raise EsphomeError("XR806 generated main.cpp is missing")
+
+    variables = {
+        "XR806_REPO_ROOT": str(repo_root),
+        "XR806_ARDUINOJSON_SRC": str(arduinojson_src),
+        "XR806_SRC": str(source),
+        "XR806_OBJDIR": str(obj),
+        "XR806_ESPHOME_MAIN": str(obj / "sdk_main_esphome.o"),
+        "XR806_OUTPUT": str(elf),
+        "XR806_FW_DIR": str(fw_dir),
+        "XR806_IMAGE_CFG": str(fw_dir / "image.cfg"),
+        "XR806_AWIH": str(image),
+    }
+
+    # Plain esphome compile owns crypto builds.
+    import re
+
+    defines = (source / "esphome/core/defines.h").read_text()
+    if re.search(r"(?m)^\s*#define\s+USE_NOISE(?:\s|$)", defines):
+        try:
+            variables.update(prepare_noise_build())
+        except (OSError, RuntimeError, subprocess.CalledProcessError) as err:
+            raise EsphomeError(f"XR806 Noise ARM build failed: {err}") from err
+
+    command = [
+        "make",
+        "-f",
+        "Makefile",
+        "-f",
+        str(adapter),
+        *(f"{key}={value}" for key, value in variables.items()),
+        str(image),
+    ]
+
+    print(f"[XR806] Building: {CORE.name}", flush=True)
+
+    try:
+        result = subprocess.run(
+            command,
+            cwd=sdk,
+            check=False,
+        )
+    except OSError as err:
+        raise EsphomeError(f"XR806 build could not start: {err}") from err
+
+    if result.returncode != 0:
+        raise EsphomeError(f"XR806 build failed (exit {result.returncode})")
+
+    if not image.is_file():
+        raise EsphomeError(f"XR806 firmware missing: {image}")
+
+    with image.open("rb") as firmware:
+        if firmware.read(4) != b"AWIH":
+            raise EsphomeError("Invalid XR806 AWIH firmware header")
+
+    from .build_support.ota_image import (
+        ESPHOME_BOOT_PRIV,
+        boot_priv,
+        make_ota_image,
+        stamp_boot_header,
+    )
+
+    try:
+        firmware = stamp_boot_header(
+            image.read_bytes(),
+            Path(variables["XR806_IMAGE_CFG"]).read_text(encoding="utf-8"),
+        )
+    except (OSError, ValueError) as err:
+        raise EsphomeError(f"XR806 BOOT header: {err}") from err
+    if "ota" in CORE.config and boot_priv(firmware) != ESPHOME_BOOT_PRIV:
+        raise EsphomeError(
+            "XR806 image.cfg OTA layout differs from ESPHOME_BOOT_OTA_LAYOUT; "
+            "converted devices would move to a different layout than this firmware.bin"
+        )
+
+    destination = CORE.firmware_bin
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not destination.is_file() or destination.read_bytes() != firmware:
+        destination.write_bytes(firmware)
+    print(f"[XR806] Firmware: {destination}", flush=True)
+
+    # The network update file: the APP sections compressed for the bootloader.
+    # firmware.bin stays the full image for a wired flash.
+    ota_output = destination.with_name(OTA_IMAGE_NAME)
+    ota_output.unlink(missing_ok=True)
+    if "ota" in CORE.config:
+        try:
+            ota, info = make_ota_image(firmware)
+        except ValueError as err:
+            raise EsphomeError(f"XR806 OTA image: {err}") from err
+        ota_output.write_bytes(ota)
+        print(
+            f"[XR806] OTA image: {ota_output} ({info.ota_bytes} of {info.slot_bytes} bytes)",
+            flush=True,
+        )
+
+    return True
+
+
+def ota_image(binary: Path) -> Path:
+    """Network updates send the compressed APP image, not the full firmware.bin."""
+    ota = Path(binary).with_name(OTA_IMAGE_NAME)
+    if not ota.is_file():
+        raise EsphomeError(f"No XR806 OTA image was built: {ota}")
+    return ota
+
+
+# Register the platform's native GPIO schema during platform import.
+from . import gpio as _xr806_gpio  # noqa: E402, F401  # pylint: disable=wrong-import-position

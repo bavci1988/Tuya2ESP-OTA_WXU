@@ -1,0 +1,173 @@
+name: XR806 Firmware CI (SDK main + ESPHome dev)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/xr806-dev-integration.yml
+      - gcc.mk
+      - include/**
+      - src/**
+      - lib/**
+      - project/**
+      - tools/**
+      - ci/esphome-tests/**
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Bootstrap container for GitHub Actions
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates python3 python3-pip python3-venv make gcc build-essential libc6-dev libncurses-dev gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
+      - uses: actions/checkout@v7.0.1
+        with:
+          path: sdk
+          persist-credentials: false
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: bavci1988/esphome-xr806
+          ref: dev
+          path: esphome-xr806
+          persist-credentials: false
+      - name: Record exact tested revisions
+        run: |
+          echo "SDK SHA: $(git -C sdk rev-parse HEAD)"
+          echo "ESPHome SHA: $(git -C esphome-xr806 rev-parse HEAD)"
+      - name: Install fork into isolated Python environment
+        run: |
+          python3 -m venv /opt/esphome-venv
+          /opt/esphome-venv/bin/python -m pip install -e ./esphome-xr806
+          arm-none-eabi-gcc --version
+      - name: Generate UART0, interrupt and WLAN smoke configurations
+        run: |
+          mkdir -p ci-tests
+          cat > ci-tests/xr806_trv16_uart0_lowpower_test.yaml <<'YAML'
+          esphome:
+            name: xr806-trv16-uart0-lp
+          xr806:
+            board: wxu
+            lowpower: true
+          uart:
+            id: mcu_uart
+            baud_rate: 115200
+            tx_pin: PB0
+            rx_pin: PB1
+            rx_buffer_size: 256
+            data_bits: 8
+            stop_bits: 1
+            parity: NONE
+          YAML
+          cat > ci-tests/xr806_irq_linkprobe.yaml <<'YAML'
+          esphome:
+            name: xr806-irq-linkprobe
+          xr806:
+            board: wxu
+          binary_sensor:
+            - platform: gpio
+              name: "WXU Test input"
+              use_interrupt: true
+              pin:
+                number: PA20
+                mode: INPUT_PULLUP
+          YAML
+          cat > ci-tests/xr806_wlan_smoke.yaml <<'YAML'
+          esphome:
+            name: xr806-wlan-probe
+          xr806:
+            board: wxu
+            lowpower: true
+            wlan:
+              dtim: 1
+              listen_interval: 8
+          wifi:
+            ssid: "XR806-CI-NO-REAL-NETWORK"
+            password: "test-only-not-secret"
+            power_save_mode: light
+          YAML
+      - name: Include the ESPHome XR806 OTA test configuration
+        run: |
+          cp esphome-xr806/tests/component_tests/xr806/config/ota.yaml ci-tests/xr806_ota.yaml
+      - name: Run XR806 platform host tests
+        run: |
+          set -euo pipefail
+          apt-get install -y --no-install-recommends g++
+          for test in sdk/ci/esphome-tests/*_test.cpp; do
+            g++ -std=gnu++20 -pthread -Wall -Wextra -Werror -Iesphome-xr806 "$test" -o /tmp/host-test
+            /tmp/host-test
+            echo "PASS $(basename "$test")"
+          done
+      - name: Compile four firmwares using pre-provisioned private SDK
+        env:
+          XR806_SDK_SOURCE_DIR: ${{ github.workspace }}/sdk
+          XR806_SDK_EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          export CC_DIR="$(dirname "$(command -v arm-none-eabi-gcc)")"
+          echo "Using ARM GCC toolchain: $CC_DIR"
+          /opt/esphome-venv/bin/python -m esphome compile ci-tests/xr806_trv16_uart0_lowpower_test.yaml
+          /opt/esphome-venv/bin/python -m esphome compile ci-tests/xr806_irq_linkprobe.yaml
+          /opt/esphome-venv/bin/python -m esphome compile ci-tests/xr806_wlan_smoke.yaml
+          /opt/esphome-venv/bin/python -m esphome compile ci-tests/xr806_ota.yaml
+      - name: Verify AWIH output and image consistency
+        run: |
+          set -euo pipefail
+          for name in xr806-trv16-uart0-lp xr806-irq-linkprobe xr806-wlan-probe xr806-ota; do
+            base="ci-tests/.esphome/build/$name"
+            fw="$base/.pioenvs/$name/firmware.bin"
+            img="$base/xr806/firmware/firmware.img"
+            test -s "$fw"
+            test -s "$img"
+            test "$(head -c 4 "$fw")" = AWIH
+            # firmware.bin is firmware.img with the OTA layout added to the 64-byte BOOT header.
+            cmp -i 64 "$fw" "$img"
+            sha256sum "$fw"
+          done
+      - name: Validate stamped ROM OTA geometry and usable native XZ package
+        run: |
+          set -euo pipefail
+          /opt/esphome-venv/bin/python - <<'PY'
+          import pathlib
+          from esphome.components.xr806.build_support.ota_image import (
+              APP_ID, BOOT_ID, make_ota_image, read_section,
+          )
+          for name in ("xr806-trv16-uart0-lp", "xr806-irq-linkprobe",
+                       "xr806-wlan-probe", "xr806-ota"):
+              root = pathlib.Path("ci-tests/.esphome/build") / name / ".pioenvs" / name
+              fw = (root / "firmware.bin").read_bytes()
+              boot = read_section(fw, 0, BOOT_ID)
+              assert boot[11] == 0x1000FF, (name, "OTA metadata flash/size missing")
+              assert boot[12] == 0x13F000, (name, "wrong OTA metadata address")
+              assert boot[13] == ((640 << 16) | 1276), (name, "wrong OTA compressed capacity")
+              payload, info = make_ota_image(fw)
+              assert info.slot_bytes == 655360
+              print(name, "total_image_bytes", len(fw), "XZ_OTA_bytes", len(payload))
+              if name == "xr806-ota":
+                  output = (root / "firmware.ota.bin").read_bytes()
+                  assert output == payload, "CI OTA artifact differs from actual build"
+                  read_section(output, 0, APP_ID)
+          PY
+      - name: Upload container-built firmware
+        if: success()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: xr806-ha-container-firmware
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            ci-tests/.esphome/build/xr806-trv16-uart0-lp/.pioenvs/xr806-trv16-uart0-lp/firmware.bin
+            ci-tests/.esphome/build/xr806-irq-linkprobe/.pioenvs/xr806-irq-linkprobe/firmware.bin
+            ci-tests/.esphome/build/xr806-wlan-probe/.pioenvs/xr806-wlan-probe/firmware.bin
+            ci-tests/.esphome/build/xr806-ota/.pioenvs/xr806-ota/firmware.bin
+            ci-tests/.esphome/build/xr806-ota/.pioenvs/xr806-ota/firmware.ota.bin

@@ -1,0 +1,55 @@
+#pragma once
+
+#include "esphome/core/component.h"
+#include "esphome/core/hal.h"
+#include <span>
+
+namespace esphome::sm16716 {
+
+class SM16716 final : public Component {
+ public:
+  /// One value per channel, a static array from code generation.
+  explicit SM16716(std::span<uint8_t> pwm_amounts) : pwm_amounts_(pwm_amounts) {}
+
+  void set_data_pin(GPIOPin *data_pin) { data_pin_ = data_pin; }
+  void set_clock_pin(GPIOPin *clock_pin) { clock_pin_ = clock_pin; }
+  void set_num_chips(uint8_t num_chips) { num_chips_ = num_chips; }
+
+  void setup() override;
+
+  void dump_config() override;
+
+  float get_setup_priority() const override { return setup_priority::HARDWARE; }
+
+  /// Send new values if they were updated.
+  void loop() override;
+
+  void write_channel(uint8_t channel, float state) {
+    auto value = uint8_t(state * 0xFF);
+    uint8_t index = this->pwm_amounts_.size() - channel - 1;
+    if (this->pwm_amounts_[index] != value) {
+      this->update_ = true;
+    }
+    this->pwm_amounts_[index] = value;
+  }
+
+ protected:
+  void write_bit_(bool value) {
+    this->data_pin_->digital_write(value);
+    this->clock_pin_->digital_write(true);
+    this->clock_pin_->digital_write(false);
+  }
+  void write_byte_(uint8_t data) {
+    for (uint8_t mask = 0x80; mask; mask >>= 1) {
+      this->write_bit_(data & mask);
+    }
+  }
+
+  GPIOPin *data_pin_;
+  GPIOPin *clock_pin_;
+  uint8_t num_chips_;
+  std::span<uint8_t> pwm_amounts_;
+  bool update_{true};
+};
+
+}  // namespace esphome::sm16716

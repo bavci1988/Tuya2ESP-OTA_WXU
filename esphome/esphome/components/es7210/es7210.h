@@ -1,0 +1,59 @@
+#pragma once
+
+#include <array>
+
+#include "esphome/components/audio_adc/audio_adc.h"
+#include "esphome/components/i2c/i2c.h"
+#include "esphome/core/component.h"
+
+#include "es7210_const.h"
+
+namespace esphome::es7210 {
+
+enum ES7210BitsPerSample : uint8_t {
+  ES7210_BITS_PER_SAMPLE_16 = 16,
+  ES7210_BITS_PER_SAMPLE_18 = 18,
+  ES7210_BITS_PER_SAMPLE_20 = 20,
+  ES7210_BITS_PER_SAMPLE_24 = 24,
+  ES7210_BITS_PER_SAMPLE_32 = 32,
+};
+
+class ES7210 final : public audio_adc::AudioAdc, public Component, public i2c::I2CDevice {
+  /* Class for configuring an ES7210 ADC for microphone input.
+   * Based on code from:
+   * - https://github.com/espressif/esp-bsp/ (accessed 20241219)
+   * - https://github.com/espressif/esp-adf/ (accessed 20241219)
+   */
+ public:
+  void setup() override;
+  void dump_config() override;
+
+  void set_bits_per_sample(ES7210BitsPerSample bits_per_sample) { this->bits_per_sample_ = bits_per_sample; }
+  /// Sets all four channel gains, replacing any configured per-channel gains.
+  bool set_mic_gain(float mic_gain) override;
+  /// Sets a zero-based channel gain; returns false for an invalid channel or an I2C failure.
+  bool set_channel_gain(uint8_t channel, float gain);
+  void set_sample_rate(uint32_t sample_rate) { this->sample_rate_ = sample_rate; }
+  void set_tdm(bool enable_tdm) { this->enable_tdm_ = enable_tdm; }
+
+  /// Returns the MIC1 gain; other channels may have different gains.
+  float mic_gain() override { return this->channel_gains_[0]; };
+
+ protected:
+  /// @brief Convert floating point mic gain value to register value
+  /// @param mic_gain Gain value to convert
+  /// @return Corresponding register value for specified gain
+  uint8_t es7210_gain_reg_value_(float mic_gain);
+
+  bool configure_i2s_format_();
+  bool configure_mic_gain_();
+  bool configure_sample_rate_();
+
+  bool setup_complete_{false};
+  bool enable_tdm_{false};
+  std::array<float, 4> channel_gains_{{0.0f, 0.0f, 0.0f, 0.0f}};
+  ES7210BitsPerSample bits_per_sample_{ES7210_BITS_PER_SAMPLE_16};
+  uint32_t sample_rate_{0};
+};
+
+}  // namespace esphome::es7210

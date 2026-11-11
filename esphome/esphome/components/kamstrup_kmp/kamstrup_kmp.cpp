@@ -1,0 +1,274 @@
+#include "kamstrup_kmp.h"
+
+#include "esphome/core/helpers.h"
+#include "esphome/core/log.h"
+#include "esphome/core/progmem.h"
+
+namespace esphome::kamstrup_kmp {
+
+ESPHOME_LOG_TAG(TAG, "kamstrup_kmp");
+
+// KMP units indexed by unit code; the empty first entry doubles as the fallback for unknown codes
+PROGMEM_STRING_TABLE(KmpUnits, "", "Wh", "kWh", "MWh", "GWh", "J", "kJ", "MJ", "GJ", "Cal", "kCal", "Mcal", "Gcal",
+                     "varh", "kvarh", "Mvarh", "Gvarh", "VAh", "kVAh", "MVAh", "GVAh", "kW", "kW", "MW", "GW", "kvar",
+                     "kvar", "Mvar", "Gvar", "VA", "kVA", "MVA", "GVA", "V", "A", "kV", "kA", "C", "K", "l", "m3",
+                     "l/h", "m3/h", "m3xC", "ton", "ton/h", "h", "hh:mm:ss", "yy:mm:dd", "yyyy:mm:dd", "mm:dd", "",
+                     "bar", "RTC", "ASCII", "m3 x 10", "ton x 10", "GJ x 10", "minutes", "Bitfield", "s", "ms", "days",
+                     "RTC-Q", "Datetime");
+
+void KamstrupKMPComponent::dump_config() {
+  ESP_LOGCONFIG(TAG, "kamstrup_kmp:");
+  LOG_UPDATE_INTERVAL(this);
+
+  LOG_SENSOR("  ", "Heat Energy", this->heat_energy_sensor_);
+  LOG_SENSOR("  ", "Power", this->power_sensor_);
+  LOG_SENSOR("  ", "Temperature 1", this->temp1_sensor_);
+  LOG_SENSOR("  ", "Temperature 2", this->temp2_sensor_);
+  LOG_SENSOR("  ", "Temperature Difference", this->temp_diff_sensor_);
+  LOG_SENSOR("  ", "Flow", this->flow_sensor_);
+  LOG_SENSOR("  ", "Volume", this->volume_sensor_);
+
+  for (size_t i = 0; i < this->custom_sensors_.size(); i++) {
+    LOG_SENSOR("  ", "Custom Sensor", this->custom_sensors_[i]);
+    ESP_LOGCONFIG(TAG, "    Command: 0x%04X", this->custom_commands_[i]);
+  }
+}
+
+void KamstrupKMPComponent::update() {
+  if (this->heat_energy_sensor_ != nullptr) {
+    this->command_queue_.push(CMD_HEAT_ENERGY);
+  }
+
+  if (this->power_sensor_ != nullptr) {
+    this->command_queue_.push(CMD_POWER);
+  }
+
+  if (this->temp1_sensor_ != nullptr) {
+    this->command_queue_.push(CMD_TEMP1);
+  }
+
+  if (this->temp2_sensor_ != nullptr) {
+    this->command_queue_.push(CMD_TEMP2);
+  }
+
+  if (this->temp_diff_sensor_ != nullptr) {
+    this->command_queue_.push(CMD_TEMP_DIFF);
+  }
+
+  if (this->flow_sensor_ != nullptr) {
+    this->command_queue_.push(CMD_FLOW);
+  }
+
+  if (this->volume_sensor_ != nullptr) {
+    this->command_queue_.push(CMD_VOLUME);
+  }
+
+  for (uint16_t custom_command : this->custom_commands_) {
+    this->command_queue_.push(custom_command);
+  }
+}
+
+void KamstrupKMPComponent::loop() {
+  if (!this->command_queue_.empty()) {
+    uint16_t command = this->command_queue_.front();
+    this->send_command_(command);
+    this->command_queue_.pop();
+  }
+}
+
+void KamstrupKMPComponent::send_command_(uint16_t command) {
+  uint32_t msg_len = 5;
+  uint8_t msg[msg_len];
+
+  msg[0] = 0x3F;
+  msg[1] = 0x10;
+  msg[2] = 0x01;
+  put_be16(msg + 3, command);
+
+  this->discard_available();
+  this->send_message_(msg, msg_len);
+  this->read_command_(command);
+}
+
+void KamstrupKMPComponent::send_message_(const uint8_t *msg, int msg_len) {
+  int buffer_len = msg_len + 2;
+  uint8_t buffer[buffer_len];
+
+  // Prepare the basic message and appand CRC
+  for (int i = 0; i < msg_len; i++) {
+    buffer[i] = msg[i];
+  }
+
+  put_be16(buffer + buffer_len - 2, crc16be(buffer, buffer_len - 2));
+
+  // Prepare actual TX message
+  uint8_t tx_msg[20];
+  int tx_msg_len = 1;
+  tx_msg[0] = 0x80;  // prefix
+
+  for (int i = 0; i < buffer_len; i++) {
+    if (buffer[i] == 0x06 || buffer[i] == 0x0d || buffer[i] == 0x1b || buffer[i] == 0x40 || buffer[i] == 0x80) {
+      if (tx_msg_len + 2 >= static_cast<int>(sizeof(tx_msg))) {
+        ESP_LOGE(TAG, "TX message overflow");
+        return;
+      }
+      tx_msg[tx_msg_len++] = 0x1b;
+      tx_msg[tx_msg_len++] = buffer[i] ^ 0xff;
+    } else {
+      if (tx_msg_len + 1 >= static_cast<int>(sizeof(tx_msg))) {
+        ESP_LOGE(TAG, "TX message overflow");
+        return;
+      }
+      tx_msg[tx_msg_len++] = buffer[i];
+    }
+  }
+
+  tx_msg[tx_msg_len++] = 0x0D;  // EOM
+
+  this->write_array(tx_msg, tx_msg_len);
+}
+
+void KamstrupKMPComponent::read_command_(uint16_t command) {
+  uint8_t buffer[20] = {0};
+  size_t buffer_len = 0;
+  int data;
+  int timeout = 250;  // ms
+
+  // Read the data from the UART
+  while (timeout > 0 && buffer_len < sizeof(buffer)) {
+    if (this->available()) {
+      data = this->read();
+      if (data > -1) {
+        if (data == 0x40) {  // start of message
+          buffer_len = 0;
+        } else if (buffer_len == 0) {
+          // Ignore request echoes until the response starts.
+          continue;
+        }
+        buffer[buffer_len++] = (uint8_t) data;
+        if (data == 0x0D) {
+          break;
+        }
+      } else {
+        ESP_LOGE(TAG, "Error while reading from UART");
+      }
+    } else {
+      delay(1);
+      timeout--;
+    }
+  }
+
+  if (timeout == 0 || buffer_len == 0) {
+    ESP_LOGE(TAG, "Request timed out");
+    return;
+  }
+
+  // Only bytes from the 0x40 start byte on are stored, so just the end of the message needs checking
+  if (buffer[buffer_len - 1] != 0x0D) {
+    ESP_LOGE(TAG, "Received invalid message (EOM mismatch received 0x%02X, expected 0x0D)", buffer[buffer_len - 1]);
+    return;
+  }
+
+  // Decode
+  uint8_t msg[20] = {0};
+  int msg_len = 0;
+  for (size_t i = 1; i < buffer_len - 1 && msg_len < (int) sizeof(msg); i++) {
+    if (buffer[i] == 0x1B) {
+      msg[msg_len++] = buffer[i + 1] ^ 0xFF;
+      i++;
+    } else {
+      msg[msg_len++] = buffer[i];
+    }
+  }
+
+  // Validate CRC; a frame shorter than the CRC itself has nothing to check
+  if (msg_len < 2 || crc16be(msg, msg_len - 2) != encode_uint16(msg[msg_len - 2], msg[msg_len - 1])) {
+    ESP_LOGE(TAG, "Received invalid message (CRC mismatch)");
+    return;
+  }
+
+  // All seems good. Now parse the message
+  this->parse_command_message_(command, msg, msg_len);
+}
+
+void KamstrupKMPComponent::parse_command_message_(uint16_t command, const uint8_t *msg, int msg_len) {
+  // Validate the message
+  if (msg_len < 8) {
+    ESP_LOGE(TAG, "Received invalid message (message too small)");
+    return;
+  }
+
+  if (msg[0] != 0x3F || msg[1] != 0x10) {
+    ESP_LOGE(TAG, "Received invalid message (invalid header received 0x%02X%02X, expected 0x3F10)", msg[0], msg[1]);
+    return;
+  }
+
+  uint16_t recv_command = encode_uint16(msg[2], msg[3]);
+  if (recv_command != command) {
+    ESP_LOGE(TAG, "Received invalid message (invalid unexpected command received 0x%04X, expected 0x%04X)",
+             recv_command, command);
+    return;
+  }
+
+  uint8_t unit_idx = msg[4];
+  uint8_t mantissa_range = msg[5];
+
+  if (mantissa_range > 4 || msg_len < 7 + mantissa_range) {
+    ESP_LOGE(TAG, "Received invalid message (mantissa size %d, msg_len %d)", mantissa_range, msg_len);
+    return;
+  }
+
+  // Calculate exponent
+  int8_t exp_val = msg[6] & 0x3F;
+  if (msg[6] & 0x40) {
+    exp_val = -exp_val;
+  }
+  float exponent = pow10_int(exp_val);
+  if (msg[6] & 0x80) {
+    exponent = -exponent;
+  }
+
+  // Calculate mantissa
+  uint32_t mantissa = 0;
+  for (int i = 0; i < mantissa_range; i++) {
+    mantissa <<= 8;
+    mantissa |= msg[i + 7];
+  }
+
+  // Calculate the actual value
+  float value = mantissa * exponent;
+
+  // Set sensor value
+  this->set_sensor_value_(command, value, unit_idx);
+}
+
+void KamstrupKMPComponent::set_sensor_value_(uint16_t command, float value, uint8_t unit_idx) {
+  // Standard sensors
+  if (command == CMD_HEAT_ENERGY && this->heat_energy_sensor_ != nullptr) {
+    this->heat_energy_sensor_->publish_state(value);
+  } else if (command == CMD_POWER && this->power_sensor_ != nullptr) {
+    this->power_sensor_->publish_state(value);
+  } else if (command == CMD_TEMP1 && this->temp1_sensor_ != nullptr) {
+    this->temp1_sensor_->publish_state(value);
+  } else if (command == CMD_TEMP2 && this->temp2_sensor_ != nullptr) {
+    this->temp2_sensor_->publish_state(value);
+  } else if (command == CMD_TEMP_DIFF && this->temp_diff_sensor_ != nullptr) {
+    this->temp_diff_sensor_->publish_state(value);
+  } else if (command == CMD_FLOW && this->flow_sensor_ != nullptr) {
+    this->flow_sensor_->publish_state(value);
+  } else if (command == CMD_VOLUME && this->volume_sensor_ != nullptr) {
+    this->volume_sensor_->publish_state(value);
+  }
+
+  // Custom sensors
+  for (size_t i = 0; i < this->custom_commands_.size(); i++) {
+    if (command == this->custom_commands_[i]) {
+      this->custom_sensors_[i]->publish_state(value);
+    }
+  }
+
+  ESP_LOGD(TAG, "Received value for command 0x%04X: %.3f [%s]", command, value,
+           LOG_STR_ARG(KmpUnits::get_log_str(unit_idx, 0)));
+}
+
+}  // namespace esphome::kamstrup_kmp

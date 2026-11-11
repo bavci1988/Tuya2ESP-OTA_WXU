@@ -1,0 +1,27 @@
+light:
+  - platform: neopixelbus
+    id: addr3
+    name: Neopixelbus Light
+    gamma_correct: 2.8
+    color_correct: [0.0, 0.0, 0.0, 0.0]
+    default_transition_length: 10s
+    effects:
+      - addressable_flicker:
+          name: Flicker Effect With Custom Values
+          update_interval: 16ms
+          intensity: 5%
+      - addressable_color_wipe:
+          name: Color Wipe With Random
+          colors:
+            - red: 100%
+              green: 0%
+              blue: 0%
+              num_leds: 2
+              gradient: true
+            - random: true
+              num_leds: 1
+    type: GRBW
+    variant: SK6812
+    method: esp8266_uart
+    num_leds: 5
+    pin: 2

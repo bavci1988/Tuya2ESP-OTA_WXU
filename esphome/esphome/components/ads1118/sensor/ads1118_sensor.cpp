@@ -1,0 +1,29 @@
+#include "ads1118_sensor.h"
+
+#include "esphome/core/log.h"
+
+namespace esphome::ads1118 {
+
+ESPHOME_LOG_TAG(TAG, "ads1118.sensor");
+
+void ADS1118Sensor::dump_config() {
+  LOG_SENSOR("  ", "ADS1118 Sensor", this);
+  ESP_LOGCONFIG(TAG,
+                "    Multiplexer: %u\n"
+                "    Gain: %u",
+                this->multiplexer_, this->gain_);
+}
+
+float ADS1118Sensor::sample() {
+  return this->parent_->request_measurement(this->multiplexer_, this->gain_, this->temperature_mode_);
+}
+
+void ADS1118Sensor::update() {
+  float v = this->sample();
+  if (!std::isnan(v)) {
+    ESP_LOGD(TAG, "'%s': Got Voltage=%fV", LOG_STR_ARG(this->get_log_name()), v);
+    this->publish_state(v);
+  }
+}
+
+}  // namespace esphome::ads1118

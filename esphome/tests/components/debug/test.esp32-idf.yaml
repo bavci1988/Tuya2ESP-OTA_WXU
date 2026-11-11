@@ -1,0 +1,16 @@
+packages:
+  debug: !include common.yaml
+
+esp32:
+  cpu_frequency: 240MHz
+
+sensor:
+  - platform: debug
+    psram:
+      name: "Free PSRAM"
+    fragmentation:
+      name: "Heap Fragmentation"
+    min_free:
+      name: "Heap Min Free"
+
+psram:

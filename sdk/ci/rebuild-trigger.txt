@@ -1,0 +1,1 @@
+Rebuild with ESPHome SDK dependency pin 35d11286e56fb7546355e4b5352b2f560724e35c

@@ -1,0 +1,259 @@
+// ENS160 sensor with I2C interface from ScioSense
+//
+// Datasheet: https://www.sciosense.com/wp-content/uploads/documents/SC-001224-DS-7-ENS160-Datasheet.pdf
+//
+// Implementation based on:
+//   https://github.com/sciosense/ENS160_driver
+
+// For best performance, the sensor shall be operated in normal indoor air in the range -5 to 60°C
+// (typical: 25°C); relative humidity: 20 to 80%RH (typical: 50%RH), non-condensing with no aggressive
+// or poisonous gases present. Prolonged exposure to environments outside these conditions can affect
+// performance and lifetime of the sensor.
+// The sensor is designed for indoor use and is not waterproof or dustproof. It should be protected from
+// water, condensation, dust, and aggressive gases. Note that the status will only be stored in non-volatile
+// memory after an initial 24 h of continuous operation. If unpowered before the conclusion of that period,
+// the ENS160 will resume "Initial Start-up" mode after re-powering.
+
+#include "ens160_base.h"
+#include "esphome/core/log.h"
+#include "esphome/core/helpers.h"
+#include "esphome/core/hal.h"
+
+namespace esphome::ens160_base {
+
+ESPHOME_LOG_TAG(TAG, "ens160");
+
+// Datasheet specifies 10ms, but some users report that 10ms is not sufficient for the
+// sensor to boot and be ready for commands. 11ms seems to be a safe value.
+static const uint8_t ENS160_BOOTING = 11;
+
+static const uint16_t ENS160_PART_ID = 0x0160;
+
+static const uint8_t ENS160_REG_PART_ID = 0x00;
+static const uint8_t ENS160_REG_OPMODE = 0x10;
+static const uint8_t ENS160_REG_CONFIG = 0x11;
+static const uint8_t ENS160_REG_COMMAND = 0x12;
+static const uint8_t ENS160_REG_TEMP_IN = 0x13;
+static const uint8_t ENS160_REG_DATA_STATUS = 0x20;
+static const uint8_t ENS160_REG_DATA_AQI = 0x21;
+static const uint8_t ENS160_REG_DATA_TVOC = 0x22;
+static const uint8_t ENS160_REG_DATA_ECO2 = 0x24;
+
+static const uint8_t ENS160_REG_GPR_READ_0 = 0x48;
+static const uint8_t ENS160_REG_GPR_READ_4 = ENS160_REG_GPR_READ_0 + 4;
+
+static const uint8_t ENS160_COMMAND_NOP = 0x00;
+static const uint8_t ENS160_COMMAND_CLRGPR = 0xCC;
+static const uint8_t ENS160_COMMAND_GET_APPVER = 0x0E;
+
+static const uint8_t ENS160_OPMODE_RESET = 0xF0;
+static const uint8_t ENS160_OPMODE_IDLE = 0x01;
+static const uint8_t ENS160_OPMODE_STD = 0x02;
+
+static const uint8_t ENS160_DATA_STATUS_STATAS = 0x80;
+static const uint8_t ENS160_DATA_STATUS_STATER = 0x40;
+static const uint8_t ENS160_DATA_STATUS_VALIDITY = 0x0C;
+static const uint8_t ENS160_DATA_STATUS_NEWDAT = 0x02;
+static const uint8_t ENS160_DATA_STATUS_NEWGPR = 0x01;
+
+// helps remove reserved bits in aqi data register
+static const uint8_t ENS160_DATA_AQI = 0x07;
+
+void ENS160Component::setup() {
+  // check part_id
+  uint16_t part_id;
+  if (!this->setup_check(this->read_bytes(ENS160_REG_PART_ID, reinterpret_cast<uint8_t *>(&part_id), 2)))
+    return;
+  if (!this->setup_check(part_id == ENS160_PART_ID, LOG_STR("Sensor reported an invalid ID. Is this a ENS160?")))
+    return;
+
+  // set mode to reset
+  if (!this->setup_check(this->write_byte(ENS160_REG_OPMODE, ENS160_OPMODE_RESET)))
+    return;
+  delay(ENS160_BOOTING);
+
+  // check status
+  uint8_t status_value;
+  if (!this->setup_check(this->read_byte(ENS160_REG_DATA_STATUS, &status_value)))
+    return;
+  this->validity_flag_ = static_cast<ValidityFlag>((ENS160_DATA_STATUS_VALIDITY & status_value) >> 2);
+
+  if (!this->setup_check(this->validity_flag_ != INVALID_OUTPUT, LOG_STR("Invalid Device Status - No valid output")))
+    return;
+
+  // set mode to idle
+  if (!this->setup_check(this->write_byte(ENS160_REG_OPMODE, ENS160_OPMODE_IDLE)))
+    return;
+  delay(ENS160_BOOTING);
+
+  // clear command
+  if (!this->setup_check(this->write_byte(ENS160_REG_COMMAND, ENS160_COMMAND_NOP)))
+    return;
+  if (!this->setup_check(this->write_byte(ENS160_REG_COMMAND, ENS160_COMMAND_CLRGPR)))
+    return;
+  delay(ENS160_BOOTING);
+
+  // read firmware version
+  if (!this->setup_check(this->write_byte(ENS160_REG_COMMAND, ENS160_COMMAND_GET_APPVER)))
+    return;
+  delay(ENS160_BOOTING);
+
+  uint8_t version_data[3];
+  if (!this->setup_check(this->read_bytes(ENS160_REG_GPR_READ_4, version_data, 3)))
+    return;
+  this->firmware_ver_major_ = version_data[0];
+  this->firmware_ver_minor_ = version_data[1];
+  this->firmware_ver_build_ = version_data[2];
+
+  // set mode to standard
+  if (!this->setup_check(this->write_byte(ENS160_REG_OPMODE, ENS160_OPMODE_STD)))
+    return;
+
+  // read opmode and check standard mode is achieved before finishing Setup
+  uint8_t op_mode;
+  if (!this->setup_check(this->read_byte(ENS160_REG_OPMODE, &op_mode)))
+    return;
+
+  this->setup_check(op_mode == ENS160_OPMODE_STD, LOG_STR("Device failed to achieve Standard Operating Mode"));
+}
+
+void ENS160Component::update() {
+  uint8_t status_value, data_ready;
+
+  if (!this->read_byte(ENS160_REG_DATA_STATUS, &status_value)) {
+    ESP_LOGW(TAG, "Error reading status register");
+    this->status_set_warning();
+    return;
+  }
+
+  // verbose status logging
+  ESP_LOGV(TAG,
+           "ENS160 Status Register: 0x%02x\n"
+           "  STATAS bit    0x%x\n"
+           "  STATER bit    0x%x\n"
+           "  VALIDITY FLAG 0x%02x\n"
+           "  NEWDAT bit    0x%x\n"
+           "  NEWGPR bit    0x%x",
+           status_value, (ENS160_DATA_STATUS_STATAS & (status_value)) == ENS160_DATA_STATUS_STATAS,
+           (ENS160_DATA_STATUS_STATER & (status_value)) == ENS160_DATA_STATUS_STATER,
+           (ENS160_DATA_STATUS_VALIDITY & status_value) >> 2,
+           (ENS160_DATA_STATUS_NEWDAT & (status_value)) == ENS160_DATA_STATUS_NEWDAT,
+           (ENS160_DATA_STATUS_NEWGPR & (status_value)) == ENS160_DATA_STATUS_NEWGPR);
+
+  data_ready = ENS160_DATA_STATUS_NEWDAT & status_value;
+  this->validity_flag_ = static_cast<ValidityFlag>((ENS160_DATA_STATUS_VALIDITY & status_value) >> 2);
+
+  switch (validity_flag_) {
+    case NORMAL_OPERATION:
+      if (data_ready != ENS160_DATA_STATUS_NEWDAT) {
+        ESP_LOGD(TAG, "ENS160 readings unavailable - Normal Operation but readings not ready");
+        return;
+      }
+      break;
+    case INITIAL_STARTUP:
+      if (!this->initial_startup_) {
+        this->initial_startup_ = true;
+        ESP_LOGI(TAG, "ENS160 readings unavailable - 1 hour startup required after first power on");
+      }
+      return;
+    case WARMING_UP:
+      if (!this->warming_up_) {
+        this->warming_up_ = true;
+        ESP_LOGI(TAG, "ENS160 readings not available yet - Warming up requires 3 minutes");
+        this->send_env_data_();
+      }
+      return;
+    case INVALID_OUTPUT:
+      ESP_LOGE(TAG, "ENS160 Invalid Status - No valid output");
+      this->status_set_warning();
+      return;
+  }
+
+  // read new data
+  uint16_t data_eco2;
+  if (!this->read_bytes(ENS160_REG_DATA_ECO2, reinterpret_cast<uint8_t *>(&data_eco2), 2)) {
+    ESP_LOGW(TAG, "Error reading eCO2 data register");
+    this->status_set_warning();
+    return;
+  }
+  PUBLISH_STATE(this->co2_sensor_, data_eco2);
+
+  uint16_t data_tvoc;
+  if (!this->read_bytes(ENS160_REG_DATA_TVOC, reinterpret_cast<uint8_t *>(&data_tvoc), 2)) {
+    ESP_LOGW(TAG, "Error reading TVOC data register");
+    this->status_set_warning();
+    return;
+  }
+  PUBLISH_STATE(this->tvoc_sensor_, data_tvoc);
+
+  uint8_t data_aqi;
+  if (!this->read_byte(ENS160_REG_DATA_AQI, &data_aqi)) {
+    ESP_LOGW(TAG, "Error reading AQI data register");
+    this->status_set_warning();
+    return;
+  }
+  if (this->aqi_sensor_ != nullptr) {
+    // remove reserved bits, just in case they are used in future
+    data_aqi = ENS160_DATA_AQI & data_aqi;
+    this->aqi_sensor_->publish_state(data_aqi);
+  }
+
+  this->status_clear_warning();
+
+  // set temperature and humidity compensation data
+  this->send_env_data_();
+}
+
+void ENS160Component::send_env_data_() {
+  if (this->temperature_sensor_ == nullptr && this->humidity_sensor_ == nullptr)
+    return;
+
+  const float temperature = sensor::source_value(this->temperature_sensor_, -40.0f, 85.0f);
+  if (std::isnan(temperature)) {
+    ESP_LOGW(TAG, "Invalid external temperature - compensation values not updated");
+    return;
+  } else {
+    ESP_LOGV(TAG, "External temperature compensation: %.1f°C", temperature);
+  }
+
+  const float humidity = sensor::source_value(this->humidity_sensor_, 0.0f, 100.0f);
+  if (std::isnan(humidity)) {
+    ESP_LOGW(TAG, "Invalid external humidity - compensation values not updated");
+    return;
+  } else {
+    ESP_LOGV(TAG, "External humidity compensation:    %.1f%%", humidity);
+  }
+
+  uint8_t data[4];
+  put_le16(data, static_cast<uint16_t>((temperature + 273.15f) * 64.0f));
+  put_le16(data + 2, static_cast<uint16_t>(humidity * 512.0f));
+
+  if (!this->write_bytes(ENS160_REG_TEMP_IN, data, 4)) {
+    ESP_LOGE(TAG, "Error writing compensation values");
+    this->status_set_warning();
+    return;
+  }
+}
+
+void ENS160Component::dump_config() {
+  ESP_LOGCONFIG(TAG, "ENS160:");
+  if (!this->is_failed()) {
+    ESP_LOGD(TAG, "Setup successful");
+  }
+  ESP_LOGI(TAG, "Firmware Version: %d.%d.%d", this->firmware_ver_major_, this->firmware_ver_minor_,
+           this->firmware_ver_build_);
+
+  LOG_UPDATE_INTERVAL(this);
+  LOG_SENSOR("  ", "CO2 Sensor:", this->co2_sensor_);
+  LOG_SENSOR("  ", "TVOC Sensor:", this->tvoc_sensor_);
+  LOG_SENSOR("  ", "AQI Sensor:", this->aqi_sensor_);
+
+  if (this->temperature_sensor_ != nullptr && this->humidity_sensor_ != nullptr) {
+    LOG_SENSOR("  ", "  Temperature Compensation:", this->temperature_sensor_);
+    LOG_SENSOR("  ", "  Humidity Compensation:", this->humidity_sensor_);
+  } else {
+    ESP_LOGCONFIG(TAG, "  Compensation: Not configured");
+  }
+}
+
+}  // namespace esphome::ens160_base

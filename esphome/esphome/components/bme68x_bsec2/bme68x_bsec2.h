@@ -1,0 +1,167 @@
+#pragma once
+
+#include "esphome/core/component.h"
+#include "esphome/core/defines.h"
+#include "esphome/core/helpers.h"
+#include "esphome/core/preferences.h"
+
+#ifdef USE_BSEC2
+
+#ifdef USE_SENSOR
+#include "esphome/components/sensor/sensor.h"
+#endif
+
+#ifdef USE_TEXT_SENSOR
+#include "esphome/components/text_sensor/text_sensor.h"
+#endif
+
+#include <cinttypes>
+
+#include <bsec2.h>
+
+namespace esphome::bme68x_bsec2 {
+
+enum AlgorithmOutput {
+  ALGORITHM_OUTPUT_IAQ,
+  ALGORITHM_OUTPUT_CLASSIFICATION,
+  ALGORITHM_OUTPUT_REGRESSION,
+};
+
+enum OperatingAge {
+  OPERATING_AGE_4D,
+  OPERATING_AGE_28D,
+};
+
+enum SampleRate {
+  SAMPLE_RATE_LP = 0,
+  SAMPLE_RATE_ULP = 1,
+  SAMPLE_RATE_DEFAULT = 2,
+};
+
+enum Voltage {
+  VOLTAGE_1_8V,
+  VOLTAGE_3_3V,
+};
+
+class BME68xBSEC2Component : public Component {
+ public:
+  void setup() override;
+  void dump_config() override;
+  void loop() override;
+
+  void set_algorithm_output(AlgorithmOutput algorithm_output) { this->algorithm_output_ = algorithm_output; }
+  void set_operating_age(OperatingAge operating_age) { this->operating_age_ = operating_age; }
+  void set_temperature_offset(float offset) { this->temperature_offset_ = offset; }
+  void set_voltage(Voltage voltage) { this->voltage_ = voltage; }
+
+  void set_sample_rate(SampleRate sample_rate) { this->sample_rate_ = sample_rate; }
+  void set_temperature_sample_rate(SampleRate sample_rate) { this->temperature_sample_rate_ = sample_rate; }
+  void set_pressure_sample_rate(SampleRate sample_rate) { this->pressure_sample_rate_ = sample_rate; }
+  void set_humidity_sample_rate(SampleRate sample_rate) { this->humidity_sample_rate_ = sample_rate; }
+
+  void set_bsec2_configuration(const uint8_t *data, const uint32_t len) {
+    this->bsec2_configuration_ = data;
+    this->bsec2_configuration_length_ = len;
+  }
+
+  void set_state_save_interval(uint32_t interval) { this->state_save_interval_ms_ = interval; }
+
+#ifdef USE_SENSOR
+  SUB_SENSOR(temperature)
+  SUB_SENSOR(pressure)
+  SUB_SENSOR(humidity)
+  SUB_SENSOR(gas_resistance)
+  SUB_SENSOR(iaq)
+  SUB_SENSOR(iaq_static)
+  SUB_SENSOR(iaq_accuracy)
+  SUB_SENSOR(co2_equivalent)
+  SUB_SENSOR(breath_voc_equivalent)
+#endif
+#ifdef USE_TEXT_SENSOR
+  SUB_TEXT_SENSOR(iaq_accuracy)
+#endif
+  virtual uint32_t get_hash() = 0;
+
+ protected:
+  // States waiting for loop() to publish them, one per pass
+  enum PublishSlot : uint8_t {
+    PUBLISH_SLOT_IAQ,
+    PUBLISH_SLOT_IAQ_STATIC,
+    PUBLISH_SLOT_CO2_EQUIVALENT,
+    PUBLISH_SLOT_BREATH_VOC_EQUIVALENT,
+    PUBLISH_SLOT_PRESSURE,
+    PUBLISH_SLOT_GAS_RESISTANCE,
+    PUBLISH_SLOT_TEMPERATURE,
+    PUBLISH_SLOT_HUMIDITY,
+    PUBLISH_SLOT_IAQ_ACCURACY,
+    PUBLISH_SLOT_IAQ_ACCURACY_TEXT,
+    PUBLISH_SLOT_SAVE_STATE,
+    PUBLISH_SLOT_COUNT,
+  };
+  struct __attribute__((packed)) PendingPublish {
+    float value;  // the accuracy for the accuracy and save slots
+    PublishSlot slot;
+  };
+  // A read returns up to 3 fields in parallel mode, each published in full
+  static constexpr uint8_t PUBLISH_QUEUE_SIZE = 3 * PUBLISH_SLOT_COUNT;
+
+  void set_config_(const uint8_t *config, u_int32_t len);
+  float calc_sensor_sample_rate_(SampleRate sample_rate);
+  void update_subscription_();
+
+  void run_();
+  void read_(int64_t trigger_time_ns);
+  void publish_(const bsec_output_t *outputs, uint8_t num_outputs);
+  int64_t get_time_ns_();
+  void check_status_();
+
+#ifdef USE_SENSOR
+  void publish_sensor_(sensor::Sensor *sensor, float value, bool change_only = false);
+#endif
+#ifdef USE_TEXT_SENSOR
+  void publish_sensor_(text_sensor::TextSensor *sensor, const char *value);
+#endif
+
+  void load_state_();
+  void save_state_(uint8_t accuracy);
+
+  void queue_publish_(PublishSlot slot, float value);
+
+  struct bme68x_dev bme68x_;
+  bsec_bme_settings_t bsec_settings_;
+  bsec_version_t version_;
+  struct bme68x_heatr_conf bme68x_heatr_conf_;
+
+  StaticRingBuffer<PendingPublish, PUBLISH_QUEUE_SIZE> pending_;
+  ESPPreferenceObject bsec_state_;
+
+  uint8_t const *bsec2_configuration_{nullptr};
+
+  int64_t last_time_ms_{0};
+  int64_t trigger_time_ns_{0};  // Stored for set_timeout lambda to help avoid heap allocation on supported 32-bit
+                                // toolchains with small std::function SBO
+
+  uint32_t state_save_interval_ms_{21600000};  // 6 hours - 4 times a day
+  uint32_t last_state_save_ms_{0};
+  uint32_t millis_overflow_counter_{0};
+  uint32_t bsec2_configuration_length_{0};
+  bsec_library_return_t bsec_status_{BSEC_OK};
+
+  float temperature_offset_{0};
+
+  AlgorithmOutput algorithm_output_{ALGORITHM_OUTPUT_IAQ};
+  OperatingAge operating_age_{OPERATING_AGE_28D};
+  Voltage voltage_{VOLTAGE_3_3V};
+  SampleRate sample_rate_{SAMPLE_RATE_LP};  // Core/gas sample rate
+  SampleRate temperature_sample_rate_{SAMPLE_RATE_DEFAULT};
+  SampleRate pressure_sample_rate_{SAMPLE_RATE_DEFAULT};
+  SampleRate humidity_sample_rate_{SAMPLE_RATE_DEFAULT};
+
+  uint8_t bsec_instance_[BSEC_INSTANCE_SIZE];
+  uint8_t op_mode_;  // operating mode of sensor
+  int8_t bme68x_status_{BME68X_OK};
+  bool bsec2_blob_configured_{false};
+};
+
+}  // namespace esphome::bme68x_bsec2
+#endif

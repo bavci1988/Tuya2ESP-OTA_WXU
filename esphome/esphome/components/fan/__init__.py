@@ -1,0 +1,362 @@
+from esphome import automation
+from esphome.automation import maybe_simple_id
+import esphome.codegen as cg
+import esphome.config_validation as cv
+from esphome.const import (
+    CONF_DIRECTION,
+    CONF_DIRECTION_COMMAND_TOPIC,
+    CONF_DIRECTION_STATE_TOPIC,
+    CONF_ENTITY_CATEGORY,
+    CONF_ICON,
+    CONF_ID,
+    CONF_MQTT_ID,
+    CONF_OFF_SPEED_CYCLE,
+    CONF_ON_DIRECTION_SET,
+    CONF_ON_OSCILLATING_SET,
+    CONF_ON_PRESET_SET,
+    CONF_ON_SPEED_SET,
+    CONF_ON_STATE,
+    CONF_ON_TURN_OFF,
+    CONF_ON_TURN_ON,
+    CONF_OSCILLATING,
+    CONF_OSCILLATION_COMMAND_TOPIC,
+    CONF_OSCILLATION_STATE_TOPIC,
+    CONF_RESTORE_MODE,
+    CONF_SPEED,
+    CONF_SPEED_COMMAND_TOPIC,
+    CONF_SPEED_LEVEL_COMMAND_TOPIC,
+    CONF_SPEED_LEVEL_STATE_TOPIC,
+    CONF_SPEED_STATE_TOPIC,
+    CONF_TRIGGER_ID,
+)
+from esphome.core import CORE, CoroPriority, coroutine_with_priority, entity_helpers
+from esphome.core.entity_helpers import (
+    entity_duplicate_validator,
+    mqtt_component_class,
+    queue_entity_register,
+    setup_entity,
+)
+from esphome.cpp_generator import MockObj
+
+DOMAIN = "fan"
+IS_PLATFORM_COMPONENT = True
+
+fan_ns = cg.esphome_ns.namespace("fan")
+Fan = fan_ns.class_("Fan", cg.EntityBase)
+
+FanDirection = fan_ns.enum("FanDirection", is_class=True)
+FAN_DIRECTION_ENUM = FanDirection.options("FORWARD", "REVERSE")
+
+FanRestoreMode = fan_ns.enum("FanRestoreMode", is_class=True)
+RESTORE_MODES = FanRestoreMode.options(
+    "NO_RESTORE",
+    "ALWAYS_OFF",
+    "ALWAYS_ON",
+    "RESTORE_DEFAULT_OFF",
+    "RESTORE_DEFAULT_ON",
+    "RESTORE_INVERTED_DEFAULT_OFF",
+    "RESTORE_INVERTED_DEFAULT_ON",
+)
+
+# Actions
+CycleSpeedAction = fan_ns.class_("CycleSpeedAction", automation.Action)
+
+FanTurnOnTrigger = fan_ns.class_("FanTurnOnTrigger", automation.Trigger.template())
+FanTurnOffTrigger = fan_ns.class_("FanTurnOffTrigger", automation.Trigger.template())
+FanDirectionSetTrigger = fan_ns.class_(
+    "FanDirectionSetTrigger", automation.Trigger.template(FanDirection)
+)
+FanOscillatingSetTrigger = fan_ns.class_(
+    "FanOscillatingSetTrigger", automation.Trigger.template(cg.bool_)
+)
+FanSpeedSetTrigger = fan_ns.class_(
+    "FanSpeedSetTrigger", automation.Trigger.template(cg.int_)
+)
+FanPresetSetTrigger = fan_ns.class_(
+    "FanPresetSetTrigger", automation.Trigger.template(cg.StringRef)
+)
+
+_FAN_SCHEMA = (
+    cv.ENTITY_BASE_SCHEMA.extend(entity_helpers.WEBSERVER_SORTING_SCHEMA)
+    .extend(cv.MQTT_COMMAND_COMPONENT_SCHEMA)
+    .extend(
+        {
+            cv.Optional(CONF_RESTORE_MODE, default="ALWAYS_OFF"): cv.enum(
+                RESTORE_MODES, upper=True, space="_"
+            ),
+            cv.OnlyWith(CONF_MQTT_ID, "mqtt"): cv.declare_id(
+                mqtt_component_class("MQTTFanComponent")
+            ),
+            cv.Optional(CONF_DIRECTION_STATE_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_DIRECTION_COMMAND_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.subscribe_topic
+            ),
+            cv.Optional(CONF_OSCILLATION_STATE_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_OSCILLATION_COMMAND_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.subscribe_topic
+            ),
+            cv.Optional(CONF_SPEED_LEVEL_STATE_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_SPEED_LEVEL_COMMAND_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.subscribe_topic
+            ),
+            cv.Optional(CONF_SPEED_STATE_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_SPEED_COMMAND_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.subscribe_topic
+            ),
+            cv.Optional(CONF_ON_STATE): automation.validate_automation(),
+            cv.Optional(CONF_ON_TURN_ON): automation.validate_automation(
+                {
+                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(FanTurnOnTrigger),
+                }
+            ),
+            cv.Optional(CONF_ON_TURN_OFF): automation.validate_automation(
+                {
+                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(FanTurnOffTrigger),
+                }
+            ),
+            cv.Optional(CONF_ON_DIRECTION_SET): automation.validate_automation(
+                {
+                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(
+                        FanDirectionSetTrigger
+                    ),
+                }
+            ),
+            cv.Optional(CONF_ON_OSCILLATING_SET): automation.validate_automation(
+                {
+                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(
+                        FanOscillatingSetTrigger
+                    ),
+                }
+            ),
+            cv.Optional(CONF_ON_SPEED_SET): automation.validate_automation(
+                {
+                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(FanSpeedSetTrigger),
+                }
+            ),
+            cv.Optional(CONF_ON_PRESET_SET): automation.validate_automation(
+                {
+                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(FanPresetSetTrigger),
+                }
+            ),
+        }
+    )
+)
+
+
+_FAN_SCHEMA.add_extra(entity_duplicate_validator("fan"))
+
+
+def fan_schema(
+    class_: cg.Pvariable,
+    *,
+    entity_category: str = cv.UNDEFINED,
+    icon: str = cv.UNDEFINED,
+    default_restore_mode: str = cv.UNDEFINED,
+) -> cv.Schema:
+    schema = {
+        cv.GenerateID(): cv.declare_id(class_),
+    }
+
+    for key, default, validator in [
+        (CONF_ENTITY_CATEGORY, entity_category, cv.entity_category),
+        (CONF_ICON, icon, cv.icon),
+        (
+            CONF_RESTORE_MODE,
+            default_restore_mode,
+            cv.enum(RESTORE_MODES, upper=True, space="_"),
+        ),
+    ]:
+        if default is not cv.UNDEFINED:
+            schema[cv.Optional(key, default=default)] = validator
+
+    return _FAN_SCHEMA.extend(schema)
+
+
+_PRESET_MODES_SCHEMA = cv.All(
+    cv.ensure_list(cv.string_strict),
+    cv.Length(min=1),
+)
+
+
+# speed_count_ is a uint16_t in FanTraits
+validate_speed_count = cv.int_range(min=1, max=65535)
+
+
+def validate_preset_modes(value):
+    # Check against defined schema
+    value = _PRESET_MODES_SCHEMA(value)
+
+    # Ensure preset names are unique
+    errors = []
+    presets = set()
+    for i, preset in enumerate(value):
+        # If name does not exist yet add it
+        if preset not in presets:
+            presets.add(preset)
+            continue
+
+        # Otherwise it's an error
+        errors.append(
+            cv.Invalid(
+                f"Found duplicate preset name '{preset}'. Presets must have unique names.",
+                [i],
+            )
+        )
+
+    if errors:
+        raise cv.MultipleInvalid(errors)
+
+    return value
+
+
+def set_preset_modes(var: MockObj, preset_modes: list[str]) -> None:
+    """Point the fan at a shared flash table of preset modes."""
+    if preset_modes:
+        table = cg.shared_progmem_array(
+            "fan_preset_modes", cg.const_char_ptr, preset_modes
+        )
+        cg.add(var.set_supported_preset_modes_static(table, len(preset_modes)))
+
+
+# The edge and set triggers keep their classes; each tracks the previous value.
+_TRIGGER_AUTOMATIONS = (
+    (CONF_ON_TURN_ON, []),
+    (CONF_ON_TURN_OFF, []),
+    (CONF_ON_DIRECTION_SET, [(FanDirection, "x")]),
+    (CONF_ON_OSCILLATING_SET, [(cg.bool_, "x")]),
+    (CONF_ON_SPEED_SET, [(cg.int_, "x")]),
+    (CONF_ON_PRESET_SET, [(cg.StringRef, "x")]),
+)
+
+
+@setup_entity("fan")
+async def setup_fan_core_(var, config):
+    cg.add(var.set_restore_mode(config[CONF_RESTORE_MODE]))
+
+    mqtt_ = await entity_helpers.setup_entity_integrations(var, config)
+    if mqtt_ is not None:
+        if (
+            direction_state_topic := config.get(CONF_DIRECTION_STATE_TOPIC)
+        ) is not None:
+            cg.add(mqtt_.set_custom_direction_state_topic(direction_state_topic))
+        if (
+            direction_command_topic := config.get(CONF_DIRECTION_COMMAND_TOPIC)
+        ) is not None:
+            cg.add(mqtt_.set_custom_direction_command_topic(direction_command_topic))
+        if (
+            oscillation_state_topic := config.get(CONF_OSCILLATION_STATE_TOPIC)
+        ) is not None:
+            cg.add(mqtt_.set_custom_oscillation_state_topic(oscillation_state_topic))
+        if (
+            oscillation_command_topic := config.get(CONF_OSCILLATION_COMMAND_TOPIC)
+        ) is not None:
+            cg.add(
+                mqtt_.set_custom_oscillation_command_topic(oscillation_command_topic)
+            )
+        if (
+            speed_level_state_topic := config.get(CONF_SPEED_LEVEL_STATE_TOPIC)
+        ) is not None:
+            cg.add(mqtt_.set_custom_speed_level_state_topic(speed_level_state_topic))
+        if (
+            speed_level_command_topic := config.get(CONF_SPEED_LEVEL_COMMAND_TOPIC)
+        ) is not None:
+            cg.add(
+                mqtt_.set_custom_speed_level_command_topic(speed_level_command_topic)
+            )
+        if (speed_state_topic := config.get(CONF_SPEED_STATE_TOPIC)) is not None:
+            cg.add(mqtt_.set_custom_speed_state_topic(speed_state_topic))
+        if (speed_command_topic := config.get(CONF_SPEED_COMMAND_TOPIC)) is not None:
+            cg.add(mqtt_.set_custom_speed_command_topic(speed_command_topic))
+
+    for conf in config.get(CONF_ON_STATE, []):
+        await automation.build_parent_callback_automation(
+            var, "add_on_state_callback", (Fan.operator("ptr"), "x"), conf
+        )
+    await automation.build_trigger_automations(var, config, _TRIGGER_AUTOMATIONS)
+
+
+async def register_fan(var, config):
+    if not CORE.has_id(config[CONF_ID]):
+        var = cg.Pvariable(config[CONF_ID], var)
+    queue_entity_register("fan", config)
+    CORE.register_platform_component("fan", var)
+    await setup_fan_core_(var, config)
+
+
+async def new_fan(config, *args):
+    var = cg.new_Pvariable(config[CONF_ID], *args)
+    await register_fan(var, config)
+    return var
+
+
+FAN_ACTION_SCHEMA = maybe_simple_id(
+    {
+        cv.Required(CONF_ID): cv.use_id(Fan),
+    }
+)
+
+
+automation.register_apply_action("fan.toggle", FAN_ACTION_SCHEMA, call="toggle")
+automation.register_apply_action("fan.turn_off", FAN_ACTION_SCHEMA, call="turn_off")
+
+automation.register_apply_action(
+    "fan.turn_on",
+    maybe_simple_id(
+        {
+            cv.Required(CONF_ID): cv.use_id(Fan),
+            cv.Optional(CONF_OSCILLATING): cv.templatable(cv.boolean),
+            cv.Optional(CONF_SPEED): cv.templatable(cv.int_range(1)),
+            cv.Optional(CONF_DIRECTION): cv.templatable(
+                cv.enum(FAN_DIRECTION_ENUM, upper=True)
+            ),
+        }
+    ),
+    automation.ApplyField(CONF_OSCILLATING, "set_oscillating", cg.bool_),
+    automation.ApplyField(CONF_SPEED, "set_speed", cg.int_),
+    automation.ApplyField(CONF_DIRECTION, "set_direction", FanDirection),
+    call="turn_on",
+)
+
+
+@automation.register_action(
+    "fan.cycle_speed",
+    CycleSpeedAction,
+    maybe_simple_id(
+        {
+            cv.Required(CONF_ID): cv.use_id(Fan),
+            cv.Optional(CONF_OFF_SPEED_CYCLE, default=True): cv.boolean,
+        }
+    ),
+    synchronous=True,
+)
+async def fan_cycle_speed_to_code(config, action_id, template_arg, args):
+    paren = await cg.get_variable(config[CONF_ID])
+    var = cg.new_Pvariable(action_id, template_arg, paren)
+    template_ = await cg.templatable(config[CONF_OFF_SPEED_CYCLE], args, cg.bool_)
+    cg.add(var.set_no_off_cycle(template_))
+    return var
+
+
+FAN_CONDITION_SCHEMA = automation.maybe_simple_id(
+    {
+        cv.Required(CONF_ID): cv.use_id(Fan),
+    }
+)
+
+automation.register_apply_condition("fan.is_on", FAN_CONDITION_SCHEMA, "state")
+automation.register_apply_condition(
+    "fan.is_off", FAN_CONDITION_SCHEMA, "state == false"
+)
+
+
+@coroutine_with_priority(CoroPriority.CORE)
+async def to_code(config):
+    cg.add_global(fan_ns.using)

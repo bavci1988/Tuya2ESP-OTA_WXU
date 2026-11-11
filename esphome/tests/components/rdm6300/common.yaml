@@ -1,0 +1,13 @@
+rdm6300:
+  on_tag:
+    - then:
+        - lambda: |-
+            ESP_LOGD("main", "Found tag %" PRIu32, x);
+    - then:
+        - lambda: |-
+            ESP_LOGD("main", "Second found tag %" PRIu32, x);
+
+binary_sensor:
+  - platform: rdm6300
+    uid: 7616525
+    name: RDM6300 NFC Tag

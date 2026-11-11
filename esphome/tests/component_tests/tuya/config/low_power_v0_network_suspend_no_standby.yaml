@@ -1,0 +1,23 @@
+esphome:
+  name: xr806-network-suspend-ci
+xr806:
+  board: wxu
+  lowpower: true
+  wlan:
+    network_suspend: true
+wifi:
+  ssid: TEST-NETWORK-NO-HARDWARE
+  password: TestOnlyPassword123
+  power_save_mode: light
+api:
+mdns:
+uart:
+  id: uart_mcu
+  tx_pin: PB0
+  rx_pin: PB1
+  baud_rate: 115200
+tuya:
+  id: mcu
+  uart_id: uart_mcu
+  protocol: low_power_v0
+  auto_baud: true

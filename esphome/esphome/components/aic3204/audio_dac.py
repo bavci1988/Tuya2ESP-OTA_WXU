@@ -1,0 +1,44 @@
+from esphome import automation
+import esphome.codegen as cg
+from esphome.components import i2c
+from esphome.components.audio_dac import AudioDac
+import esphome.config_validation as cv
+from esphome.const import CONF_MODE
+from esphome.types import ConfigType
+
+CODEOWNERS = ["@kbx81"]
+DEPENDENCIES = ["i2c"]
+
+aic3204_ns = cg.esphome_ns.namespace("aic3204")
+AIC3204 = aic3204_ns.class_("AIC3204", AudioDac, cg.Component, i2c.I2CDevice)
+
+
+CONFIG_SCHEMA = (
+    cv.Schema(
+        {
+            cv.GenerateID(): cv.declare_id(AIC3204),
+        }
+    )
+    .extend(cv.COMPONENT_SCHEMA)
+    .extend(i2c.i2c_device_schema(0x18))
+)
+
+
+SET_AUTO_MUTE_ACTION_SCHEMA = cv.maybe_simple_value(
+    {
+        cv.GenerateID(): cv.use_id(AIC3204),
+        cv.Required(CONF_MODE): cv.templatable(cv.int_range(max=7, min=0)),
+    },
+    key=CONF_MODE,
+)
+
+
+automation.register_apply_action(
+    "aic3204.set_auto_mute_mode",
+    SET_AUTO_MUTE_ACTION_SCHEMA,
+    automation.ApplyField(CONF_MODE, "set_auto_mute_mode", cg.uint8),
+)
+
+
+async def to_code(config: ConfigType) -> None:
+    await i2c.new_i2c_component(config)

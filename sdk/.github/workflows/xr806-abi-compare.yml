@@ -1,0 +1,73 @@
+name: XR806 GCC8 vs GCC13 ABI comparison
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install GCC13, Newlib, and ELF tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc-arm-none-eabi libnewlib-arm-none-eabi binutils-arm-none-eabi
+      - name: Obtain isolated GCC8 toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/v8.3.1-1.4/xpack-arm-none-eabi-gcc-8.3.1-1.4-linux-x64.tar.gz"
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 8 --connect-timeout 20 --max-time 240 "$url" -o /tmp/gcc8.tar.gz
+          mkdir -p "$RUNNER_TEMP/gcc8"
+          tar -xzf /tmp/gcc8.tar.gz -C "$RUNNER_TEMP/gcc8"
+          gcc8="$(find "$RUNNER_TEMP/gcc8" -type f -name arm-none-eabi-gcc -print -quit)"
+          test -n "$gcc8"
+          "$gcc8" --version
+          echo "GCC8=$gcc8" >> "$GITHUB_ENV"
+      - name: Compare ABI metadata and generated object code
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p abi-compare
+          cat > abi-compare/probe.c <<'EOF'
+          #include <stdint.h>
+          #include <stddef.h>
+          struct abi_probe { uint32_t a; uint16_t b; void *p; };
+          uint32_t abi_add(uint32_t a, uint32_t b) { return a + b; }
+          int32_t abi_sub(int32_t a, int32_t b) { return a - b; }
+          _Static_assert(sizeof(int) == 4 && sizeof(long) == 4 && sizeof(void*) == 4, "32-bit ARM data model required");
+          _Static_assert(sizeof(struct abi_probe) == 12, "Unexpected ABI struct layout");
+          EOF
+          for version in 8 13; do
+            if [ "$version" = 8 ]; then compiler="$GCC8"; else compiler="$(command -v arm-none-eabi-gcc)"; fi
+            prefix="$(dirname "$compiler")/arm-none-eabi-"
+            "$compiler" -mcpu=cortex-m33 -mthumb -mfloat-abi=softfp -std=c11 -Os -c abi-compare/probe.c -o "abi-compare/gcc${version}.o"
+            "$compiler" --version | head -1 > "abi-compare/gcc${version}-version.txt"
+            "$compiler" -mcpu=cortex-m33 -mthumb -mfloat-abi=softfp -dM -E -x c /dev/null | grep -E '__((U)?INT32_TYPE__|SIZEOF_(INT|LONG|POINTER)__|ARM_PCS|BYTE_ORDER__)' | sort > "abi-compare/gcc${version}-types.txt"
+            "${prefix}readelf" -h -A "abi-compare/gcc${version}.o" > "abi-compare/gcc${version}-elf.txt"
+            "${prefix}objdump" -dr "abi-compare/gcc${version}.o" > "abi-compare/gcc${version}-disassembly.txt"
+          done
+          diff -u abi-compare/gcc8-types.txt abi-compare/gcc13-types.txt > abi-compare/type-diff.txt || true
+          echo '--- GCC8/GCC13 fixed-width type differences ---'
+          cat abi-compare/type-diff.txt
+          echo '--- Precompiled XR806 WLAN archive ELF attributes ---'
+          for archive in lib/xradio_v2/libwlan.a lib/xradio_v2/libxrwireless.a lib/xradio_v3/libwlan.a lib/xradio_v3/libxrwireless.a; do
+            if [ -f "$archive" ]; then
+              echo "ARCHIVE: $archive"
+              arm-none-eabi-readelf -h -A "$archive" 2>&1 | grep -E 'File:|Machine:|Flags:|Tag_CPU_arch:|Tag_ABI_(VFP_args|HardFP_use|align_needed|align_preserved):' | head -100 || true
+            fi
+          done | tee abi-compare/vendor-libraries.txt
+          echo 'ABI comparison generated. Matching size and attributes alone do not establish runtime compatibility.'
+      - name: Publish ABI evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: xr806-gcc8-gcc13-abi-compare
+          path: abi-compare/
+          if-no-files-found: warn
+          retention-days: 30

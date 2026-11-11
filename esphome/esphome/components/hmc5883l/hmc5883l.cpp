@@ -1,0 +1,124 @@
+#include "hmc5883l.h"
+#include "esphome/core/log.h"
+#include "esphome/core/application.h"
+
+#include <numbers>
+
+namespace esphome::hmc5883l {
+
+ESPHOME_LOG_TAG(TAG, "hmc5883l");
+static const uint8_t HMC5883L_ADDRESS = 0x1E;
+static const uint8_t HMC5883L_REGISTER_CONFIG_A = 0x00;
+static const uint8_t HMC5883L_REGISTER_CONFIG_B = 0x01;
+static const uint8_t HMC5883L_REGISTER_MODE = 0x02;
+static const uint8_t HMC5883L_REGISTER_DATA_X_MSB = 0x03;
+static const uint8_t HMC5883L_REGISTER_DATA_X_LSB = 0x04;
+static const uint8_t HMC5883L_REGISTER_DATA_Z_MSB = 0x05;
+static const uint8_t HMC5883L_REGISTER_DATA_Z_LSB = 0x06;
+static const uint8_t HMC5883L_REGISTER_DATA_Y_MSB = 0x07;
+static const uint8_t HMC5883L_REGISTER_DATA_Y_LSB = 0x08;
+static const uint8_t HMC5883L_REGISTER_STATUS = 0x09;
+static const uint8_t HMC5883L_REGISTER_IDENTIFICATION_A = 0x0A;
+static const uint8_t HMC5883L_REGISTER_IDENTIFICATION_B = 0x0B;
+static const uint8_t HMC5883L_REGISTER_IDENTIFICATION_C = 0x0C;
+
+void HMC5883LComponent::setup() {
+  uint8_t id[3];
+  if (!this->read_byte(HMC5883L_REGISTER_IDENTIFICATION_A, &id[0]) ||
+      !this->read_byte(HMC5883L_REGISTER_IDENTIFICATION_B, &id[1]) ||
+      !this->read_byte(HMC5883L_REGISTER_IDENTIFICATION_C, &id[2])) {
+    this->mark_failed(LOG_STR(ESP_LOG_MSG_COMM_FAIL));
+    return;
+  }
+
+  if (this->get_update_interval() < App.get_loop_interval()) {
+    high_freq_.start();
+  }
+
+  if (id[0] != 0x48 || id[1] != 0x34 || id[2] != 0x33) {
+    this->mark_failed(LOG_STR("The ID registers don't match - Is this really an HMC5883L?"));
+    return;
+  }
+
+  uint8_t config_a = 0;
+  config_a |= this->oversampling_ << 5;
+  config_a |= this->datarate_ << 2;
+  config_a |= 0b0 << 0;  // Measurement Mode: Normal(high impedance on load)
+  if (!this->setup_check(this->write_byte(HMC5883L_REGISTER_CONFIG_A, config_a)))
+    return;
+
+  uint8_t config_b = 0;
+  config_b |= this->range_ << 5;
+  if (!this->setup_check(this->write_byte(HMC5883L_REGISTER_CONFIG_B, config_b)))
+    return;
+
+  uint8_t mode = 0;
+  // Continuous Measurement Mode
+  mode |= 0b00;
+  if (!this->setup_check(this->write_byte(HMC5883L_REGISTER_MODE, mode)))
+    return;
+}
+void HMC5883LComponent::dump_config() {
+  ESP_LOGCONFIG(TAG, "HMC5883L:");
+  LOG_I2C_DEVICE(this);
+  LOG_UPDATE_INTERVAL(this);
+
+  LOG_SENSOR("  ", "X Axis", this->x_sensor_);
+  LOG_SENSOR("  ", "Y Axis", this->y_sensor_);
+  LOG_SENSOR("  ", "Z Axis", this->z_sensor_);
+  LOG_SENSOR("  ", "Heading", this->heading_sensor_);
+}
+void HMC5883LComponent::update() {
+  uint16_t raw_x, raw_y, raw_z;
+  if (!this->read_byte_16(HMC5883L_REGISTER_DATA_X_MSB, &raw_x) ||
+      !this->read_byte_16(HMC5883L_REGISTER_DATA_Y_MSB, &raw_y) ||
+      !this->read_byte_16(HMC5883L_REGISTER_DATA_Z_MSB, &raw_z)) {
+    this->status_set_warning();
+    return;
+  }
+
+  float mg_per_bit;
+  switch (this->range_) {
+    case HMC5883L_RANGE_88_UT:
+      mg_per_bit = 0.73f;
+      break;
+    case HMC5883L_RANGE_130_UT:
+      mg_per_bit = 0.92f;
+      break;
+    case HMC5883L_RANGE_190_UT:
+      mg_per_bit = 1.22f;
+      break;
+    case HMC5883L_RANGE_250_UT:
+      mg_per_bit = 1.52f;
+      break;
+    case HMC5883L_RANGE_400_UT:
+      mg_per_bit = 2.27f;
+      break;
+    case HMC5883L_RANGE_470_UT:
+      mg_per_bit = 2.56f;
+      break;
+    case HMC5883L_RANGE_560_UT:
+      mg_per_bit = 3.03f;
+      break;
+    case HMC5883L_RANGE_810_UT:
+      mg_per_bit = 4.35f;
+      break;
+    default:
+      mg_per_bit = NAN;
+  }
+
+  // in µT
+  const float x = int16_t(raw_x) * mg_per_bit * 0.1f;
+  const float y = int16_t(raw_y) * mg_per_bit * 0.1f;
+  const float z = int16_t(raw_z) * mg_per_bit * 0.1f;
+
+  float heading = atan2f(0.0f - x, y) * 180.0f / std::numbers::pi_v<float>;
+  ESP_LOGD(TAG, "Got x=%0.02fµT y=%0.02fµT z=%0.02fµT heading=%0.01f°", x, y, z, heading);
+
+  PUBLISH_STATE(this->x_sensor_, x);
+  PUBLISH_STATE(this->y_sensor_, y);
+  PUBLISH_STATE(this->z_sensor_, z);
+  PUBLISH_STATE(this->heading_sensor_, heading);
+}
+
+}  // namespace esphome::hmc5883l

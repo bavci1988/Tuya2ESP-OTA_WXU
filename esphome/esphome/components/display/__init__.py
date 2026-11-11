@@ -1,0 +1,409 @@
+from dataclasses import dataclass
+import logging
+from typing import Any, Protocol
+
+from esphome import automation, core, pins
+from esphome.automation import maybe_simple_id
+import esphome.codegen as cg
+from esphome.components.const import (
+    BYTE_ORDER_BIG,
+    CONF_BYTE_ORDER,
+    CONF_DRAW_ROUNDING,
+    KEY_METADATA,
+)
+import esphome.config_validation as cv
+from esphome.const import (
+    CONF_AUTO_CLEAR_ENABLED,
+    CONF_DIMENSIONS,
+    CONF_ENABLE_PIN,
+    CONF_FROM,
+    CONF_HEIGHT,
+    CONF_ID,
+    CONF_LAMBDA,
+    CONF_PAGE_ID,
+    CONF_PAGES,
+    CONF_ROTATION,
+    CONF_TO,
+    CONF_UPDATE_INTERVAL,
+    CONF_WIDTH,
+    SCHEDULER_DONT_RUN,
+)
+from esphome.core import CORE, ID, CoroPriority, coroutine_with_priority
+from esphome.final_validate import full_config, get_declaring_config
+from esphome.types import ConfigType
+
+DOMAIN = "display"
+IS_PLATFORM_COMPONENT = True
+
+_LOGGER = logging.getLogger(__name__)
+
+display_ns = cg.esphome_ns.namespace("display")
+Display = display_ns.class_("Display", cg.PollingComponent)
+DisplayBuffer = display_ns.class_("DisplayBuffer", Display)
+DisplayPage = display_ns.class_("DisplayPage")
+DisplayPagePtr = DisplayPage.operator("ptr")
+DisplayRef = Display.operator("ref")
+DisplayPageShowAction = display_ns.class_("DisplayPageShowAction", automation.Action)
+
+CONF_ON_PAGE_CHANGE = "on_page_change"
+CONF_SHOW_TEST_CARD = "show_test_card"
+CONF_UNSPECIFIED = "unspecified"
+
+_request_page_change_slot = cg.slot_counter("DISPLAY_PAGE_CHANGE_CALLBACK_COUNT")
+
+DISPLAY_ROTATIONS = {
+    0: display_ns.DISPLAY_ROTATION_0_DEGREES,
+    90: display_ns.DISPLAY_ROTATION_90_DEGREES,
+    180: display_ns.DISPLAY_ROTATION_180_DEGREES,
+    270: display_ns.DISPLAY_ROTATION_270_DEGREES,
+}
+
+
+class DisplayModel(Protocol):
+    """The parts of a display model used by enable_pin_schema()."""
+
+    def get_default(self, key: str, fallback: Any = ...) -> Any: ...
+
+
+def enable_pin_schema(
+    model: DisplayModel, config: ConfigType
+) -> dict[cv.Optional, Any]:
+    """
+    Get the schema entry for a display's enable pins.
+    Pins given in the user config are used as they are. Otherwise the model's default enable
+    pins are used, except any that is also used elsewhere in the config, so a user can take
+    control of that pin, e.g. with a switch.
+    :param config: The display config as given by the user
+    """
+    schema = cv.ensure_list(pins.gpio_output_pin_schema)
+    default = model.get_default(CONF_ENABLE_PIN, None)
+    if default is None or CONF_ENABLE_PIN in config:
+        return {cv.Optional(CONF_ENABLE_PIN): schema}
+    return {
+        cv.Optional(
+            CONF_ENABLE_PIN, default=default
+        ): pins.PIN_SCHEMA_REGISTRY.optional(schema)
+    }
+
+
+def validate_rotation(value):
+    value = cv.string(value)
+    value = value.removesuffix("°")
+    return cv.enum(DISPLAY_ROTATIONS, int=True)(value)
+
+
+def validate_auto_clear(value):
+    if value == CONF_UNSPECIFIED:
+        return value
+    return cv.boolean(value)
+
+
+BASIC_DISPLAY_SCHEMA = cv.Schema(
+    {
+        cv.Exclusive(CONF_LAMBDA, CONF_LAMBDA): cv.lambda_,
+    }
+).extend(cv.polling_component_schema("1s"))
+
+
+def _validate_test_card(config: ConfigType) -> ConfigType:
+    if (
+        config.get(CONF_SHOW_TEST_CARD, False)
+        and (update_interval := config.get(CONF_UPDATE_INTERVAL)) is not None
+        and update_interval.total_milliseconds == SCHEDULER_DONT_RUN
+    ):
+        # Only a warning: something else can still update the display, for example
+        # component.update, and the test card is drawn then.
+        display_id = config.get(CONF_ID)
+        _LOGGER.warning(
+            "%s`%s: True` is used with `%s: never`, so the test card is only drawn "
+            "when something updates the display (for example component.update)",
+            f"{display_id.id}: " if display_id is not None and display_id.id else "",
+            CONF_SHOW_TEST_CARD,
+            CONF_UPDATE_INTERVAL,
+        )
+    return config
+
+
+FULL_DISPLAY_SCHEMA = BASIC_DISPLAY_SCHEMA.extend(
+    {
+        cv.Optional(CONF_ROTATION): validate_rotation,
+        cv.Exclusive(CONF_PAGES, CONF_LAMBDA): cv.All(
+            cv.ensure_list(
+                {
+                    cv.GenerateID(): cv.declare_id(DisplayPage),
+                    cv.Required(CONF_LAMBDA): cv.lambda_,
+                }
+            ),
+            cv.Length(min=1),
+        ),
+        cv.Optional(CONF_ON_PAGE_CHANGE): automation.validate_automation(
+            {
+                cv.Optional(CONF_FROM): cv.use_id(DisplayPage),
+                cv.Optional(CONF_TO): cv.use_id(DisplayPage),
+            }
+        ),
+        cv.Optional(
+            CONF_AUTO_CLEAR_ENABLED, default=CONF_UNSPECIFIED
+        ): validate_auto_clear,
+        cv.Optional(CONF_SHOW_TEST_CARD): cv.boolean,
+    }
+)
+FULL_DISPLAY_SCHEMA.add_extra(_validate_test_card)
+
+
+async def setup_display_core_(var, config):
+    if rotation := config.get(CONF_ROTATION, 0):
+        # Default initialised value for rotation is 0
+        cg.add(var.set_rotation(DISPLAY_ROTATIONS[rotation]))
+
+    if (auto_clear := config.get(CONF_AUTO_CLEAR_ENABLED)) is not None:
+        # Default to true if pages or lambda is specified. Ideally this would be done during validation, but
+        # the possible schemas are too complex to do this easily.
+        if auto_clear == CONF_UNSPECIFIED:
+            auto_clear = CONF_LAMBDA in config or CONF_PAGES in config
+        cg.add(var.set_auto_clear(auto_clear))
+
+    if CONF_PAGES in config:
+        pages = []
+        for conf in config[CONF_PAGES]:
+            lambda_ = await cg.process_lambda(
+                conf[CONF_LAMBDA], [(DisplayRef, "it")], return_type=cg.void
+            )
+            page = cg.new_Pvariable(conf[CONF_ID], lambda_)
+            pages.append(page)
+        cg.add(var.set_pages(pages))
+    for conf in config.get(CONF_ON_PAGE_CHANGE, []):
+        _request_page_change_slot(str(var))
+        checks = []
+        for key, name in ((CONF_FROM, "from"), (CONF_TO, "to")):
+            if (page_id := conf.get(key)) is not None:
+                page = await cg.get_variable(page_id)
+                checks.append(f"{name} == ::{page}")
+        await automation.build_callback_automation(
+            var,
+            "add_on_page_change_callback",
+            [(DisplayPagePtr, "from"), (DisplayPagePtr, "to")],
+            conf,
+            when=" && ".join(checks) or None,
+        )
+    if config.get(CONF_SHOW_TEST_CARD):
+        cg.add(var.show_test_card())
+
+
+# Storage of display metadata in a central location, accessible via the id
+
+
+@dataclass(frozen=True)
+class DisplayMetaData:
+    width: int = 0
+    height: int = 0
+    has_hardware_rotation: bool = False
+    byte_order: str = BYTE_ORDER_BIG
+    has_writer: bool = False
+    rotation: int = 0
+    draw_rounding: int = 0
+
+
+def _get_metadata_list() -> list[tuple]:
+    """Get the raw metadata list. Each entry is (id, DisplayMetaData)."""
+    return CORE.data.setdefault(DOMAIN, {}).setdefault(KEY_METADATA, [])
+
+
+def get_all_display_metadata() -> dict[str, DisplayMetaData]:
+    """Get all display metadata as a dict keyed by resolved ID strings.
+
+    Must not be called before IDs have been finalised.
+    """
+    entries = _get_metadata_list()
+    assert all(id_.id is not None for id_, _ in entries), (
+        "get_all_display_metadata called before display IDs have been resolved"
+    )
+    return {id_.id: meta for id_, meta in entries}
+
+
+def get_display_metadata(display_id: ID) -> DisplayMetaData:
+    """Get display metadata by ID object
+
+    Must not be called before IDs have been finalised.
+    """
+    for id_, meta in _get_metadata_list():
+        if id_ is display_id:
+            return meta
+        assert id_.id is not None, (
+            "get_display_metadata called before display IDs have been resolved"
+        )
+        if id_.id == display_id.id:
+            return meta
+    # No metadata found, display driver may not yet support it.
+    # Read the raw config to populate the returned data
+    disp_config = get_declaring_config(display_id)
+    dimensions = disp_config.get(CONF_DIMENSIONS, (0, 0))
+    if isinstance(dimensions, dict):
+        dimensions = (dimensions.get(CONF_WIDTH, 0), dimensions.get(CONF_HEIGHT, 0))
+    elif not isinstance(dimensions, tuple) or len(dimensions) != 2:
+        dimensions = (0, 0)
+
+    meta = DisplayMetaData(
+        width=dimensions[0],
+        height=dimensions[1],
+        has_hardware_rotation=False,
+        byte_order=disp_config.get(CONF_BYTE_ORDER, cv.UNDEFINED),
+        has_writer=disp_config.get(CONF_AUTO_CLEAR_ENABLED) is True
+        or disp_config.get(CONF_PAGES) is not None
+        or disp_config.get(CONF_LAMBDA) is not None
+        or disp_config.get(CONF_SHOW_TEST_CARD) is True,
+        rotation=disp_config.get(CONF_ROTATION, 0),
+        draw_rounding=disp_config.get(CONF_DRAW_ROUNDING, 0),
+    )
+    _get_metadata_list().append((display_id, meta))
+    return meta
+
+
+def add_metadata(
+    id: ID,
+    width: int,
+    height: int,
+    has_hardware_rotation: bool = False,
+    byte_order: str = BYTE_ORDER_BIG,
+    has_writer: bool = False,
+    rotation: int = 0,
+    draw_rounding: int = 0,
+):
+    entries = _get_metadata_list()
+    assert not any(existing_id is id for existing_id, _ in entries), (
+        f"Duplicate display metadata for ID {id}"
+    )
+    entries.append(
+        (
+            id,
+            DisplayMetaData(
+                width=width,
+                height=height,
+                has_hardware_rotation=has_hardware_rotation,
+                byte_order=byte_order,
+                has_writer=has_writer,
+                rotation=rotation,
+                draw_rounding=draw_rounding,
+            ),
+        )
+    )
+
+
+KEY_EXTERNAL_WRITERS = "external_writers"
+
+
+def _get_external_writer_list() -> list[tuple[ID, str]]:
+    """Get the raw external writer list. Each entry is (display id, owner)."""
+    return CORE.data.setdefault(DOMAIN, {}).setdefault(KEY_EXTERNAL_WRITERS, [])
+
+
+def register_external_writer(display_id: ID, owner: str) -> None:
+    """Declare that ``owner`` draws into the display from outside its lambda or pages.
+
+    Call from the owner's CONFIG_SCHEMA. The ID may still be unresolved; the ID pass
+    resolves it in place before final validation.
+    """
+    _get_external_writer_list().append((display_id, owner))
+
+
+def get_external_writers(display_id: ID) -> list[str]:
+    """Get the owners registered for a display. Only valid once IDs are resolved."""
+    return [
+        owner
+        for id_, owner in _get_external_writer_list()
+        if id_.id is not None and id_.id == display_id.id
+    ]
+
+
+def has_external_writer(display_id: ID) -> bool:
+    """Tell a driver's final validation that something else draws into the display.
+
+    LVGL anywhere in the config also counts, as the drivers assumed before.
+    """
+    from esphome.components.lvgl import DOMAIN as LVGL_DOMAIN
+
+    return LVGL_DOMAIN in full_config.get() or bool(get_external_writers(display_id))
+
+
+async def register_display(var, config):
+    await cg.register_component(var, config)
+    await setup_display_core_(var, config)
+
+
+async def add_writer(
+    var: cg.MockObj, config: ConfigType, ref: cg.MockObj = DisplayRef
+) -> None:
+    """Pass the configured lambda, if any, to var.set_writer.
+
+    ref is the type of `it`; drivers with their own drawing class pass theirs.
+    """
+    if (lambda_config := config.get(CONF_LAMBDA)) is not None:
+        lambda_ = await cg.process_lambda(
+            lambda_config, [(ref, "it")], return_type=cg.void
+        )
+        cg.add(var.set_writer(lambda_))
+
+
+@automation.register_action(
+    "display.page.show",
+    DisplayPageShowAction,
+    maybe_simple_id(
+        {
+            cv.Required(CONF_ID): cv.templatable(cv.use_id(DisplayPage)),
+        }
+    ),
+    synchronous=True,
+)
+async def display_page_show_to_code(config, action_id, template_arg, args):
+    var = cg.new_Pvariable(action_id, template_arg)
+    if isinstance(config[CONF_ID], core.Lambda):
+        template_ = await cg.templatable(config[CONF_ID], args, DisplayPagePtr)
+        cg.add(var.set_page(template_))
+    else:
+        paren = await cg.get_variable(config[CONF_ID])
+        template_ = await cg.templatable(paren, args, DisplayPagePtr)
+        cg.add(var.set_page(template_))
+    return var
+
+
+# The id is the display itself, so it cannot be a lambda; a plain use_id rejects one clearly.
+DISPLAY_PAGE_CYCLE_ACTION_SCHEMA = maybe_simple_id(
+    {
+        cv.GenerateID(CONF_ID): cv.use_id(Display),
+    }
+)
+
+automation.register_apply_action(
+    "display.page.show_next",
+    DISPLAY_PAGE_CYCLE_ACTION_SCHEMA,
+    automation.ApplyCall("show_next_page()"),
+)
+automation.register_apply_action(
+    "display.page.show_previous",
+    DISPLAY_PAGE_CYCLE_ACTION_SCHEMA,
+    automation.ApplyCall("show_prev_page()"),
+)
+
+
+automation.register_apply_condition(
+    "display.is_displaying_page",
+    cv.maybe_simple_value(
+        {
+            cv.GenerateID(CONF_ID): cv.use_id(Display),
+            cv.Required(CONF_PAGE_ID): cv.use_id(DisplayPage),
+        },
+        key=CONF_PAGE_ID,
+    ),
+    automation.ApplyCall("get_active_page() == {}", ((CONF_PAGE_ID, DisplayPagePtr),)),
+)
+
+
+@coroutine_with_priority(CoroPriority.CORE)
+async def to_code(config):
+    cg.add_global(display_ns.using)
+    cg.add_define("USE_DISPLAY")
+    if CORE.is_esp32:
+        # Re-enable ESP-IDF's LCD driver (excluded by default to save compile time)
+        from esphome.components.esp32 import include_builtin_idf_component
+
+        include_builtin_idf_component("esp_lcd")

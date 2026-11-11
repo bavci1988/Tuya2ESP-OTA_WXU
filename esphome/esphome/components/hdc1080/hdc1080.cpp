@@ -1,0 +1,71 @@
+#include "hdc1080.h"
+#include "esphome/core/log.h"
+#include "esphome/core/hal.h"
+
+namespace esphome::hdc1080 {
+
+ESPHOME_LOG_TAG(TAG, "hdc1080");
+
+static const uint8_t HDC1080_CMD_CONFIGURATION = 0x02;
+static const uint8_t HDC1080_CMD_TEMPERATURE = 0x00;
+static const uint8_t HDC1080_CMD_HUMIDITY = 0x01;
+
+void HDC1080Component::setup() {
+  const uint8_t config[2] = {0x00, 0x00};  // resolution 14bit for both humidity and temperature
+
+  // if configuration fails - there is a problem
+  if (this->write_register(HDC1080_CMD_CONFIGURATION, config, 2) != i2c::ERROR_OK) {
+    ESP_LOGW(TAG, "Failed to configure HDC1080");
+    this->status_set_warning();
+    return;
+  }
+}
+
+void HDC1080Component::dump_config() {
+  ESP_LOGCONFIG(TAG, "HDC1080:");
+  LOG_I2C_DEVICE(this);
+  LOG_UPDATE_INTERVAL(this);
+  LOG_SENSOR("  ", "Temperature", this->temperature_sensor_);
+  LOG_SENSOR("  ", "Humidity", this->humidity_sensor_);
+}
+
+void HDC1080Component::update() {
+  // regardless of what sensor/s are defined in yaml configuration
+  // the hdc1080 setup configuration used, requires both temperature and humidity to be read
+
+  this->status_clear_warning();
+
+  if (this->write(&HDC1080_CMD_TEMPERATURE, 1) != i2c::ERROR_OK) {
+    this->status_set_warning();
+    return;
+  }
+
+  this->set_timeout(20, [this]() {
+    uint16_t raw_temperature;
+    if (this->read(reinterpret_cast<uint8_t *>(&raw_temperature), 2) != i2c::ERROR_OK) {
+      this->status_set_warning();
+      return;
+    }
+
+    // raw * 2^-16 * 165 - 40
+    PUBLISH_STATE(this->temperature_sensor_, i2c::i2ctohs(raw_temperature) * 0.0025177f - 40.0f);
+
+    if (this->write(&HDC1080_CMD_HUMIDITY, 1) != i2c::ERROR_OK) {
+      this->status_set_warning();
+      return;
+    }
+
+    this->set_timeout(20, [this]() {
+      uint16_t raw_humidity;
+      if (this->read(reinterpret_cast<uint8_t *>(&raw_humidity), 2) != i2c::ERROR_OK) {
+        this->status_set_warning();
+        return;
+      }
+
+      // raw * 2^-16 * 100
+      PUBLISH_STATE(this->humidity_sensor_, i2c::i2ctohs(raw_humidity) * 0.001525879f);
+    });
+  });
+}
+
+}  // namespace esphome::hdc1080

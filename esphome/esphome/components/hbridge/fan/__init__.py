@@ -1,0 +1,63 @@
+from esphome import automation
+from esphome.automation import maybe_simple_id
+import esphome.codegen as cg
+from esphome.components import fan, output
+from esphome.components.fan import validate_preset_modes
+import esphome.config_validation as cv
+from esphome.const import (
+    CONF_DECAY_MODE,
+    CONF_ENABLE_PIN,
+    CONF_PIN_A,
+    CONF_PIN_B,
+    CONF_PRESET_MODES,
+    CONF_SPEED_COUNT,
+)
+from esphome.types import ConfigType
+
+from .. import hbridge_ns
+
+CODEOWNERS = ["@WeekendWarrior"]
+
+
+HBridgeFan = hbridge_ns.class_("HBridgeFan", cg.Component, fan.Fan)
+
+DecayMode = hbridge_ns.enum("DecayMode")
+DECAY_MODE_OPTIONS = DecayMode.options("SLOW", "FAST", prefix="DECAY_MODE_")
+
+CONFIG_SCHEMA = (
+    fan.fan_schema(HBridgeFan)
+    .extend(
+        {
+            cv.Required(CONF_PIN_A): cv.use_id(output.FloatOutput),
+            cv.Required(CONF_PIN_B): cv.use_id(output.FloatOutput),
+            cv.Optional(CONF_DECAY_MODE, default="SLOW"): cv.enum(
+                DECAY_MODE_OPTIONS, upper=True
+            ),
+            cv.Optional(CONF_SPEED_COUNT, default=100): fan.validate_speed_count,
+            cv.Optional(CONF_ENABLE_PIN): cv.use_id(output.FloatOutput),
+            cv.Optional(CONF_PRESET_MODES): validate_preset_modes,
+        }
+    )
+    .extend(cv.COMPONENT_SCHEMA)
+)
+
+
+automation.register_apply_action(
+    "fan.hbridge.brake",
+    maybe_simple_id({cv.GenerateID(): cv.use_id(HBridgeFan)}),
+    automation.ApplyCall("brake()"),
+)
+
+
+async def to_code(config: ConfigType) -> None:
+    var = await fan.new_fan(
+        config,
+        config[CONF_SPEED_COUNT],
+        config[CONF_DECAY_MODE],
+    )
+    await cg.register_component(var, config)
+    await cg.add_variable(var.set_pin_a, config[CONF_PIN_A])
+    await cg.add_variable(var.set_pin_b, config[CONF_PIN_B])
+    await cg.add_variable(var.set_enable_pin, config.get(CONF_ENABLE_PIN))
+
+    fan.set_preset_modes(var, config.get(CONF_PRESET_MODES, []))

@@ -1,0 +1,85 @@
+#include "iaqcore.h"
+#include "esphome/core/hal.h"
+#include "esphome/core/helpers.h"
+#include "esphome/core/log.h"
+
+namespace esphome::iaqcore {
+
+ESPHOME_LOG_TAG(TAG, "iaqcore");
+
+enum IAQCoreErrorCode : uint8_t { ERROR_OK = 0, ERROR_RUNIN = 0x10, ERROR_BUSY = 0x01, ERROR_ERROR = 0x80 };
+
+static constexpr size_t SENSOR_DATA_LENGTH = 9;
+
+struct SensorData {
+  int32_t resistance;
+  uint16_t co2;
+  uint16_t tvoc;
+  IAQCoreErrorCode status;
+
+  SensorData(const uint8_t *buffer) {
+    this->co2 = encode_uint16(buffer[0], buffer[1]);
+    this->status = static_cast<IAQCoreErrorCode>(buffer[2]);
+    this->resistance = encode_uint32(buffer[3], buffer[4], buffer[5], buffer[6]);
+    this->tvoc = encode_uint16(buffer[7], buffer[8]);
+  }
+};
+
+void IAQCore::setup() {
+  if (!this->setup_check(this->write(nullptr, 0) == i2c::ERROR_OK))
+    return;
+}
+
+void IAQCore::update() {
+  uint8_t buffer[SENSOR_DATA_LENGTH];
+
+  if (this->read_register(0xB5, buffer, SENSOR_DATA_LENGTH) != i2c::ERROR_OK) {
+    ESP_LOGD(TAG, "Read failed");
+    this->status_set_warning();
+    this->publish_nans_();
+    return;
+  }
+
+  SensorData data(buffer);
+
+  switch (data.status) {
+    case ERROR_OK:
+      ESP_LOGD(TAG, "OK");
+      break;
+    case ERROR_RUNIN:
+      ESP_LOGI(TAG, "Warming up");
+      break;
+    case ERROR_BUSY:
+      ESP_LOGI(TAG, "Busy");
+      break;
+    case ERROR_ERROR:
+      ESP_LOGE(TAG, "Error");
+      break;
+  }
+
+  if (data.status != ERROR_OK) {
+    this->status_set_warning();
+    this->publish_nans_();
+    return;
+  }
+
+  PUBLISH_STATE(this->co2_sensor_, data.co2);
+  PUBLISH_STATE(this->tvoc_sensor_, data.tvoc);
+
+  this->status_clear_warning();
+}
+
+void IAQCore::publish_nans_() {
+  PUBLISH_STATE(this->co2_sensor_, NAN);
+  PUBLISH_STATE(this->tvoc_sensor_, NAN);
+}
+
+void IAQCore::dump_config() {
+  ESP_LOGCONFIG(TAG, "AMS iAQ Core:");
+  LOG_I2C_DEVICE(this);
+  LOG_UPDATE_INTERVAL(this);
+  LOG_SENSOR("  ", "CO2", this->co2_sensor_);
+  LOG_SENSOR("  ", "TVOC", this->tvoc_sensor_);
+}
+
+}  // namespace esphome::iaqcore

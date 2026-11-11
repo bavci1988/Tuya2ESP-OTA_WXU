@@ -1,0 +1,187 @@
+#pragma once
+#include "esphome/core/defines.h"
+#include "esphome/core/component.h"
+#ifdef USE_BINARY_SENSOR
+#include "esphome/components/binary_sensor/binary_sensor.h"
+#endif
+#ifdef USE_SENSOR
+#include "esphome/components/sensor/sensor.h"
+#endif
+#ifdef USE_NUMBER
+#include "esphome/components/number/number.h"
+#endif
+#ifdef USE_SWITCH
+#include "esphome/components/switch/switch.h"
+#endif
+#ifdef USE_BUTTON
+#include "esphome/components/button/button.h"
+#endif
+#ifdef USE_SELECT
+#include "esphome/components/select/select.h"
+#endif
+#ifdef USE_TEXT_SENSOR
+#include "esphome/components/text_sensor/text_sensor.h"
+#endif
+#include "esphome/components/ld24xx/ld24xx.h"
+#include "esphome/components/uart/uart.h"
+#include "esphome/core/helpers.h"
+
+#include <array>
+
+namespace esphome::ld2410 {
+
+using namespace ld24xx;
+
+// Engineering data frame is 45 bytes; +1 for null terminator, +4 so that a frame footer always
+// lands inside the buffer during footer-based resynchronization after losing sync.
+static constexpr uint8_t MAX_LINE_LENGTH = 50;
+static constexpr uint8_t TOTAL_GATES = 9;  // Total number of gates supported by the LD2410
+
+enum BaudRate : uint8_t {
+  BAUD_RATE_9600 = 1,
+  BAUD_RATE_19200 = 2,
+  BAUD_RATE_38400 = 3,
+  BAUD_RATE_57600 = 4,
+  BAUD_RATE_115200 = 5,
+  BAUD_RATE_230400 = 6,
+  BAUD_RATE_256000 = 7,
+  BAUD_RATE_460800 = 8,
+};
+
+enum DistanceResolution : uint8_t {
+  DISTANCE_RESOLUTION_0_2 = 0x01,
+  DISTANCE_RESOLUTION_0_75 = 0x00,
+};
+
+// Device values of the distance resolution select options, in option order; in flash on ESP8266
+static constexpr uint8_t DISTANCE_RESOLUTIONS[] PROGMEM = {DISTANCE_RESOLUTION_0_2, DISTANCE_RESOLUTION_0_75};
+
+#ifdef USE_LD2410_BG_CORRECTION
+// Order matches BgCorrectionResultStrings
+enum class BgCorrectionResult : uint8_t {
+  BG_CORRECTION_RESULT_SUCCESS,
+  BG_CORRECTION_RESULT_FAILED,
+  BG_CORRECTION_RESULT_UNCONFIRMED,
+  BG_CORRECTION_RESULT_REFUSED,
+  BG_CORRECTION_RESULT_TIMED_OUT,
+  BG_CORRECTION_RESULT_RUNNING,
+};
+#endif
+
+class LD2410Component final : public Component, public uart::UARTDevice {
+#ifdef USE_BINARY_SENSOR
+  SUB_BINARY_SENSOR(out_pin_presence_status)
+  SUB_BINARY_SENSOR(moving_target)
+  SUB_BINARY_SENSOR(still_target)
+  SUB_BINARY_SENSOR(target)
+  SUB_BINARY_SENSOR(calibration)
+#endif
+#ifdef USE_SENSOR
+  SUB_SENSOR_WITH_DEDUP(light, uint8_t)
+  SUB_SENSOR_WITH_DEDUP(detection_distance, int)
+  SUB_SENSOR_WITH_DEDUP(moving_target_distance, int)
+  SUB_SENSOR_WITH_DEDUP(moving_target_energy, uint8_t)
+  SUB_SENSOR_WITH_DEDUP(still_target_distance, int)
+  SUB_SENSOR_WITH_DEDUP(still_target_energy, uint8_t)
+#endif
+#ifdef USE_TEXT_SENSOR
+  SUB_TEXT_SENSOR(version)
+  SUB_TEXT_SENSOR(mac)
+  SUB_TEXT_SENSOR(calibration_result)
+#endif
+#ifdef USE_NUMBER
+  SUB_NUMBER(light_threshold)
+  SUB_NUMBER(max_move_distance_gate)
+  SUB_NUMBER(max_still_distance_gate)
+  SUB_NUMBER(timeout)
+#endif
+#ifdef USE_SELECT
+  SUB_SELECT(baud_rate)
+  SUB_SELECT(distance_resolution)
+  SUB_SELECT(light_function)
+  SUB_SELECT(out_pin_level)
+#endif
+#ifdef USE_SWITCH
+  SUB_SWITCH(bluetooth)
+  SUB_SWITCH(engineering_mode)
+#endif
+#ifdef USE_BUTTON
+  SUB_BUTTON(factory_reset)
+  SUB_BUTTON(query)
+  SUB_BUTTON(restart)
+  SUB_BUTTON(background_correction)
+#endif
+
+ public:
+  void setup() override;
+  void dump_config() override;
+  void loop() override;
+  void set_light_out_control();
+#ifdef USE_NUMBER
+  void set_gate_still_threshold_number(uint8_t gate, number::Number *n);
+  void set_gate_move_threshold_number(uint8_t gate, number::Number *n);
+  void set_max_distances_timeout();
+  void set_gate_threshold(number::Number *n);
+#endif
+#ifdef USE_SENSOR
+  void set_gate_move_sensor(uint8_t gate, sensor::Sensor *s);
+  void set_gate_still_sensor(uint8_t gate, sensor::Sensor *s);
+#endif
+  void set_bluetooth_password(const std::string &password);
+  void set_engineering_mode(bool enable);
+  void read_all_info();
+  void restart_and_read_all_info();
+  void set_bluetooth(bool enable);
+  void set_distance_resolution(const char *state);
+  void set_distance_resolution(DistanceResolution resolution);
+  void set_baud_rate(const char *state);
+  void set_baud_rate(BaudRate rate);
+  void factory_reset();
+#ifdef USE_LD2410_BG_CORRECTION
+  void set_background_correction_duration(uint8_t seconds) { this->bg_correction_duration_ = seconds; }
+  void start_background_correction();
+#endif
+
+ protected:
+  void send_command_(uint8_t command_str, const uint8_t *command_value, uint8_t command_value_len);
+  void set_config_mode_(bool enable);
+  void handle_periodic_data_();
+  void handle_ack_data_();
+  bool handle_frame_(uint8_t frame_len);
+  void readline_(int readch);
+  void query_parameters_();
+  void get_version_();
+  void get_mac_();
+  void get_distance_resolution_();
+  void query_light_control_();
+  void restart_();
+#ifdef USE_LD2410_BG_CORRECTION
+  void finish_background_correction_(BgCorrectionResult result);
+  void publish_calibration_running_(bool running);
+  void publish_calibration_result_(BgCorrectionResult result);
+#endif
+
+  uint8_t light_function_ = 0;
+  uint8_t light_threshold_ = 0;
+  uint8_t out_pin_level_ = 0;
+  uint8_t buffer_pos_ = 0;  // where to resume processing/populating buffer
+  uint8_t buffer_data_[MAX_LINE_LENGTH];
+  uint8_t mac_address_[MAC_ADDRESS_SIZE] = {0, 0, 0, 0, 0, 0};
+  uint8_t version_[6] = {0, 0, 0, 0, 0, 0};
+  bool bluetooth_on_{false};
+#ifdef USE_LD2410_BG_CORRECTION
+  uint8_t bg_correction_duration_{10};  // seconds
+  bool bg_correction_running_{false};
+  BgCorrectionResult bg_correction_result_{BgCorrectionResult::BG_CORRECTION_RESULT_UNCONFIRMED};
+#endif
+#ifdef USE_NUMBER
+  std::array<number::Number *, TOTAL_GATES> gate_move_threshold_numbers_{};
+  std::array<number::Number *, TOTAL_GATES> gate_still_threshold_numbers_{};
+#endif
+#ifdef USE_SENSOR
+  std::array<sensor::SensorWithDedup<uint8_t>, TOTAL_GATES> gate_move_sensors_{};
+  std::array<sensor::SensorWithDedup<uint8_t>, TOTAL_GATES> gate_still_sensors_{};
+#endif
+};
+
+}  // namespace esphome::ld2410

@@ -1,0 +1,337 @@
+import logging
+import re
+from typing import Any
+
+from esphome import automation
+import esphome.codegen as cg
+from esphome.config import iter_ids
+import esphome.config_validation as cv
+from esphome.const import CONF_DATA, CONF_ID, CONF_PLATFORM
+from esphome.core import CORE, ID
+from esphome.cpp_generator import MockObj, TemplateArgsType
+import esphome.final_validate as fv
+from esphome.types import ConfigType
+
+_LOGGER = logging.getLogger(__name__)
+
+CODEOWNERS = ["@mvturnho", "@danielschramm"]
+DOMAIN = "canbus"
+IS_PLATFORM_COMPONENT = True
+
+CONF_CAN_ID = "can_id"
+CONF_CAN_ID_MASK = "can_id_mask"
+CONF_USE_EXTENDED_ID = "use_extended_id"
+CONF_REMOTE_TRANSMISSION_REQUEST = "remote_transmission_request"
+CONF_CANBUS_ID = "canbus_id"
+CONF_BIT_RATE = "bit_rate"
+CONF_ON_FRAME = "on_frame"
+CONF_MAX_FRAMES_PER_LOOP = "max_frames_per_loop"
+CONF_FD = "fd"
+CONF_BIT_RATE_SWITCH = "bit_rate_switch"
+CONF_PAD_DATA = "pad_data"
+CONF_DEFAULT_FD = "default_fd"
+CONF_DEFAULT_BIT_RATE_SWITCH = "default_bit_rate_switch"
+CONF_DEFAULT_PAD_DATA = "default_pad_data"
+DEFAULT_MAX_FRAMES_PER_LOOP = 50  # Keep in sync with max_frames_per_loop_ in canbus.h
+DEFAULT_BIT_RATE = "125KBPS"  # Keep in sync with bit_rate_ in canbus.h
+# All 29 id bits; received ids never use more, so on_frame skips the & for this mask
+CAN_ID_MASK_ALL = 0x1FFFFFFF
+CAN_MAX_DATA_LENGTH = 8
+# Payload length of each CAN FD DLC, keep in sync with CAN_FD_DLC_LENGTHS in canbus.h
+CAN_FD_DATA_LENGTHS = (0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64)
+# canbus.send options that need a platform built on CANBUS_FD_SCHEMA
+_FD_SEND_KEYS = (CONF_FD, CONF_BIT_RATE_SWITCH, CONF_PAD_DATA)
+
+
+def _flag(name: str, value: bool) -> str:
+    return name if value else f"!{name}"
+
+
+def validate_id(config: ConfigType) -> ConfigType:
+    if CONF_CAN_ID in config:
+        can_id = config[CONF_CAN_ID]
+        id_ext = config[CONF_USE_EXTENDED_ID]
+        if not id_ext and can_id > 0x7FF:
+            raise cv.Invalid("Standard IDs must be 11 Bit (0x000-0x7ff / 0-2047)")
+    return config
+
+
+def validate_raw_data(value: Any) -> bytes | list:
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    if isinstance(value, list):
+        return cv.Schema([cv.hex_uint8_t])(value)
+    raise cv.Invalid(
+        "data must either be a string wrapped in quotes or a list of bytes"
+    )
+
+
+canbus_ns = cg.esphome_ns.namespace("canbus")
+CanbusComponent = canbus_ns.class_("CanbusComponent", cg.Component)
+CanFrame = canbus_ns.struct("CanFrame")
+CanPayload = canbus_ns.class_("CanPayload")
+CanSpeed = canbus_ns.enum("CAN_SPEED")
+
+CAN_SPEEDS = CanSpeed.options(
+    "1KBPS",
+    "5KBPS",
+    "10KBPS",
+    "12K5BPS",
+    "16KBPS",
+    "20KBPS",
+    "25KBPS",
+    "31K25BPS",
+    "33KBPS",
+    "40KBPS",
+    "50KBPS",
+    "80KBPS",
+    "83K3BPS",
+    "95KBPS",
+    "100KBPS",
+    "125KBPS",
+    "200KBPS",
+    "250KBPS",
+    "500KBPS",
+    "800KBPS",
+    "1000KBPS",
+    prefix="CAN_",
+)
+
+# Data phase rates for a CAN FD platform's own schema
+CAN_DATA_SPEEDS = {
+    **CAN_SPEEDS,
+    **CanSpeed.options(
+        "2000KBPS",
+        "3000KBPS",
+        "4000KBPS",
+        "5000KBPS",
+        "6000KBPS",
+        "7000KBPS",
+        "8000KBPS",
+        prefix="CAN_",
+    ),
+}
+
+
+def get_rate(value: str) -> int:
+    match = re.match(r"(\d+)(?:K(\d+)?)?BPS", value, re.IGNORECASE)
+    if not match:
+        raise ValueError(f"Invalid rate format: {value}")
+    fraction = match.group(2) or "0"
+    return int((float(match.group(1)) + float(f"0.{fraction}")) * 1000)
+
+
+CANBUS_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(): cv.declare_id(CanbusComponent),
+        cv.Required(CONF_CAN_ID): cv.int_range(min=0, max=CAN_ID_MASK_ALL),
+        cv.Optional(CONF_BIT_RATE, default=DEFAULT_BIT_RATE): cv.enum(
+            CAN_SPEEDS, upper=True
+        ),
+        cv.Optional(CONF_USE_EXTENDED_ID, default=False): cv.boolean,
+        cv.Optional(
+            CONF_MAX_FRAMES_PER_LOOP, default=DEFAULT_MAX_FRAMES_PER_LOOP
+        ): cv.positive_not_null_int,
+        cv.Optional(CONF_ON_FRAME): automation.validate_automation(
+            {
+                cv.Required(CONF_CAN_ID): cv.int_range(min=0, max=CAN_ID_MASK_ALL),
+                cv.Optional(CONF_CAN_ID_MASK, default=CAN_ID_MASK_ALL): cv.int_range(
+                    min=0, max=CAN_ID_MASK_ALL
+                ),
+                cv.Optional(CONF_USE_EXTENDED_ID, default=False): cv.boolean,
+                cv.Optional(CONF_REMOTE_TRANSMISSION_REQUEST): cv.boolean,
+            },
+            validate_id,
+        ),
+    },
+).extend(cv.COMPONENT_SCHEMA)
+
+CANBUS_SCHEMA.add_extra(validate_id)
+
+# A platform whose controller supports CAN FD extends this instead of CANBUS_SCHEMA. Its buses then accept the
+# CAN FD options of canbus.send, and register_canbus() turns on USE_CANBUS_FD, which makes every CanFrame
+# 64 bytes long.
+CANBUS_FD_SCHEMA = CANBUS_SCHEMA.extend(
+    {
+        cv.Optional(CONF_DEFAULT_FD, default=False): cv.boolean,
+        cv.Optional(CONF_DEFAULT_BIT_RATE_SWITCH, default=False): cv.boolean,
+        cv.Optional(CONF_DEFAULT_PAD_DATA, default=False): cv.boolean,
+    }
+)
+
+
+def _is_fd_bus(config: ConfigType) -> bool:
+    return CONF_DEFAULT_FD in config
+
+
+async def setup_canbus_core_(var: MockObj, config: ConfigType) -> None:
+    await cg.register_component(var, config)
+    cg.add(var.set_can_id(config[CONF_CAN_ID]))
+    if config[CONF_USE_EXTENDED_ID]:
+        cg.add(var.set_use_extended_id(True))
+    if _is_fd_bus(config):
+        cg.add_define("USE_CANBUS_FD")
+        cg.add(var.set_supports_fd(True))
+        for key, setter in (
+            (CONF_DEFAULT_FD, var.set_default_fd),
+            (CONF_DEFAULT_BIT_RATE_SWITCH, var.set_default_bit_rate_switch),
+            (CONF_DEFAULT_PAD_DATA, var.set_default_pad_data),
+        ):
+            if config.get(key):
+                cg.add(setter(True))
+    if (bit_rate := config[CONF_BIT_RATE]) != DEFAULT_BIT_RATE:
+        cg.add(var.set_bitrate(CAN_SPEEDS[bit_rate]))
+    if (max_frames := config[CONF_MAX_FRAMES_PER_LOOP]) != DEFAULT_MAX_FRAMES_PER_LOOP:
+        cg.add(var.set_max_frames_per_loop(max_frames))
+
+    for conf in config.get(CONF_ON_FRAME, []):
+        can_id = f"0x{conf[CONF_CAN_ID]:X}"
+        if (mask := conf[CONF_CAN_ID_MASK]) != CAN_ID_MASK_ALL:
+            checks = [f"(frame.can_id & 0x{mask:X}) == {can_id}"]
+        else:
+            checks = [f"frame.can_id == {can_id}"]
+        checks.append(_flag("frame.use_extended_id", conf[CONF_USE_EXTENDED_ID]))
+        if (rtr := conf.get(CONF_REMOTE_TRANSMISSION_REQUEST)) is not None:
+            checks.append(_flag("frame.remote_transmission_request", rtr))
+        await automation.build_callback_automation(
+            var,
+            "add_frame_callback",
+            [
+                (CanPayload, "x"),
+                (cg.uint32, "can_id"),
+                (cg.bool_, "remote_transmission_request"),
+            ],
+            conf,
+            params=[(CanFrame.operator("const").operator("ref"), "frame")],
+            forward=[
+                "frame.payload()",
+                "frame.can_id",
+                "frame.remote_transmission_request",
+            ],
+            when=" && ".join(checks),
+        )
+
+
+async def register_canbus(
+    var: MockObj, config: ConfigType, *, reports_status: bool | None = None
+) -> None:
+    if not CORE.has_id(config[CONF_ID]):
+        var = cg.new_Pvariable(config[CONF_ID], var)
+    if reports_status is None:
+        _LOGGER.warning(
+            "CAN bus platform '%s' does not report bus state, so bus-off recovery and "
+            "error-state logging are disabled. Platform authors should either override "
+            "get_status() and get_events() and call register_canbus(..., reports_status=True) "
+            "or pass reports_status=False if the hardware cannot report it",
+            config[CONF_PLATFORM],
+        )
+    await setup_canbus_core_(var, config)
+
+
+def validate_send(action: ConfigType, bus: ConfigType) -> None:
+    """Reject a canbus.send that its bus cannot send, as far as the values are known.
+
+    Lambda values are checked when the action runs.
+    """
+    data = action[CONF_DATA]
+    length = None if cg.is_template(data) else len(data)
+    if not _is_fd_bus(bus):
+        for key in _FD_SEND_KEYS:
+            if key in action:
+                raise cv.Invalid(
+                    f"{key} needs a canbus platform that supports CAN FD", path=[key]
+                )
+        fd = False
+    else:
+        fd = action.get(CONF_FD, bus[CONF_DEFAULT_FD])
+        if fd is False and action.get(CONF_BIT_RATE_SWITCH) is True:
+            raise cv.Invalid("bit_rate_switch requires fd: true")
+        if fd is True and action[CONF_REMOTE_TRANSMISSION_REQUEST]:
+            raise cv.Invalid("remote_transmission_request cannot be used with fd: true")
+    if length is None:
+        return
+    if fd is False and length > CAN_MAX_DATA_LENGTH:
+        raise cv.Invalid("Classic CAN data must be at most 8 bytes", path=[CONF_DATA])
+    if (
+        fd is True
+        and length not in CAN_FD_DATA_LENGTHS
+        and action.get(CONF_PAD_DATA, bus[CONF_DEFAULT_PAD_DATA]) is False
+    ):
+        raise cv.Invalid("CAN FD data length requires pad_data: true", path=[CONF_DATA])
+
+
+def final_validate(config: list[ConfigType]) -> None:
+    full_config = fv.full_config.get()
+    for bus_id, path in iter_ids(full_config):
+        if len(path) < 2 or path[-2:] != ["canbus.send", CONF_CANBUS_ID]:
+            continue
+        action_path = path[:-1]
+        action = full_config.get_config_for_path(action_path)
+        bus = fv.get_declaring_config(bus_id, full_config)
+        with cv.prepend_path([cv.ROOT_CONFIG_PATH, *action_path]):
+            validate_send(action, bus)
+
+
+FINAL_VALIDATE_SCHEMA = final_validate
+
+
+# Actions
+CANBUS_SEND_ACTION_SCHEMA = cv.maybe_simple_value(
+    {
+        cv.GenerateID(CONF_CANBUS_ID): cv.use_id(CanbusComponent),
+        cv.Optional(CONF_CAN_ID): cv.int_range(min=0, max=CAN_ID_MASK_ALL),
+        cv.Optional(CONF_USE_EXTENDED_ID, default=False): cv.boolean,
+        cv.Optional(CONF_REMOTE_TRANSMISSION_REQUEST, default=False): cv.boolean,
+        cv.Optional(CONF_FD): cv.templatable(cv.boolean),
+        cv.Optional(CONF_BIT_RATE_SWITCH): cv.templatable(cv.boolean),
+        cv.Optional(CONF_PAD_DATA): cv.templatable(cv.boolean),
+        # One CAN FD frame; final_validate holds a classic bus to 8 bytes
+        cv.Required(CONF_DATA): cv.templatable(
+            cv.All(validate_raw_data, cv.Length(max=CAN_FD_DATA_LENGTHS[-1]))
+        ),
+    },
+    validate_id,
+    key=CONF_DATA,
+)
+
+
+@automation.register_action(
+    "canbus.send",
+    canbus_ns.class_("CanbusSendAction", automation.Action),
+    CANBUS_SEND_ACTION_SCHEMA,
+    synchronous=True,
+)
+async def canbus_action_to_code(
+    config: ConfigType,
+    action_id: ID,
+    template_arg: cg.TemplateArguments,
+    args: TemplateArgsType,
+) -> MockObj:
+    var = cg.new_Pvariable(action_id, template_arg)
+    await cg.register_parented(var, config[CONF_CANBUS_ID])
+
+    if (can_id := config.get(CONF_CAN_ID)) is not None:
+        cg.add(var.set_can_id(can_id))
+        cg.add(var.set_use_extended_id(config[CONF_USE_EXTENDED_ID]))
+
+    cg.add(
+        var.set_remote_transmission_request(config[CONF_REMOTE_TRANSMISSION_REQUEST])
+    )
+    # Only set on a CAN FD bus, which final_validate checks
+    for key, setter in (
+        (CONF_FD, var.set_fd),
+        (CONF_BIT_RATE_SWITCH, var.set_bit_rate_switch),
+        (CONF_PAD_DATA, var.set_pad_data),
+    ):
+        if (value := config.get(key)) is not None:
+            cg.add(setter(await cg.templatable(value, args, cg.bool_)))
+
+    await automation.templatable_bytes(
+        config[CONF_DATA],
+        args,
+        var.set_data_template,
+        var.set_data_static,
+        "canbus_data",
+        return_type=CanPayload,
+    )
+    return var
