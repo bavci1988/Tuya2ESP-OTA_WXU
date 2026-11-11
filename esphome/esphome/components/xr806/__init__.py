@@ -297,7 +297,7 @@ def run_compile(args: object, config: ConfigType) -> bool:
     import shutil
     import subprocess
 
-    from .build_support.dependencies import DEPENDENCIES, resolve_dependencies
+    from .build_support.dependencies import resolve_dependencies, sdk_revision_token
     from .build_support.noise_build import prepare_noise_build
 
     # Locate the ESPHome checkout from this platform module.
@@ -322,7 +322,7 @@ def run_compile(args: object, config: ConfigType) -> bool:
     # The vendor Makefiles generate files inside their SDK tree.
     # Never compile directly inside the shared dependency cache.
     sdk_root = xr_build / "sdk-work"
-    sdk_revision = DEPENDENCIES["xr806_sdk"]["commit"]
+    sdk_revision = sdk_revision_token(sdk_cache)
     revision_file = sdk_root / ".esphome-xr806-sdk-revision"
 
     if sdk_root.exists():

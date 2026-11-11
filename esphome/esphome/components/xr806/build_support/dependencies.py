@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -89,6 +90,52 @@ def _verify(path: Path, name: str, expected_commit: str | None = None) -> None:
             raise RuntimeError(f"Missing {name} dependency file: {relative}")
 
 
+def _verify_files(path: Path, name: str) -> None:
+    """Verify only the required files exist.
+
+    Used for an SDK that is versioned by a parent repository (no standalone
+    .git), so the Git-revision and clean-worktree checks do not apply.
+    """
+    info = DEPENDENCIES[name]
+    for relative in info["required"]:
+        if not (path / relative).is_file():
+            raise RuntimeError(f"Missing {name} dependency file: {relative}")
+
+
+def _colocated_sdk() -> Path | None:
+    """Return the SDK bundled alongside this ESPHome fork, if present.
+
+    In the consolidated Tuya2ESP-OTA_WXU layout the SDK lives at ``<repo>/sdk``,
+    a sibling of the ESPHome fork at ``<repo>/esphome``. It is versioned as part
+    of that repository (no standalone ``.git``), so it is used directly without
+    a clone or Git-revision check. When the ESPHome fork is used standalone this
+    path does not exist and the external clone is used instead.
+    """
+    sdk = Path(__file__).resolve().parents[5] / "sdk"
+    return sdk if sdk.is_dir() else None
+
+
+def sdk_revision_token(sdk_path: Path) -> str:
+    """Return a cache key for the SDK sources at ``sdk_path``.
+
+    The caller copies the SDK into an isolated build workspace and reuses that
+    copy only while this token is unchanged. An external clone is immutable, so
+    its Git HEAD is used. A co-located SDK (versioned by the parent repository,
+    no standalone ``.git``) can be edited in place, so a signature over the file
+    tree is used instead and the workspace refreshes whenever a file changes.
+    """
+    if (sdk_path / ".git").is_dir():
+        return _git("rev-parse", "HEAD", cwd=sdk_path)
+
+    digest = hashlib.sha1()
+    for path in sorted(sdk_path.rglob("*")):
+        if path.is_file():
+            stat = path.stat()
+            relative = path.relative_to(sdk_path).as_posix()
+            digest.update(f"{relative}\0{stat.st_size}\0{int(stat.st_mtime)}\0".encode())
+    return "colocated-" + digest.hexdigest()[:16]
+
+
 def ensure_dependency(name: str) -> Path:
     """Ensure a pinned dependency is present in the shared cache."""
     if name not in DEPENDENCIES:
@@ -116,6 +163,15 @@ def ensure_dependency(name: str) -> Path:
             _verify(source, name, expected_commit or None)
             print(f"[XR806] Verified external SDK checkout: {source}", flush=True)
             return source
+
+        # Consolidated layout: use the SDK bundled next to this fork directly.
+        # It is versioned by the parent repository, so there is no clone and no
+        # Git-revision check; only the required files are verified.
+        colocated = _colocated_sdk()
+        if colocated is not None:
+            _verify_files(colocated, name)
+            print(f"[XR806] Using in-repo SDK: {colocated}", flush=True)
+            return colocated
 
     parent = CACHE_ROOT / name
     destination = parent / info["commit"]
